@@ -14,10 +14,18 @@ player_bp = Blueprint('player', __name__)
 # games 字典将从主应用传入
 games = None
 
+# 当前唯一活跃的房间（单房间模式：说书人同时只主持一局）
+current_game_id = None
+
 def init_player_api(games_dict):
     """初始化玩家API，传入games字典"""
     global games
     games = games_dict
+
+def set_current_game(game_id):
+    """设置当前活跃游戏（每次说书人新建游戏时调用）"""
+    global current_game_id
+    current_game_id = game_id
 
 
 # ==================== 页面路由 ====================
@@ -70,6 +78,28 @@ def find_game_by_code(game_code):
             })
     
     return jsonify({"found": False})
+
+
+@player_bp.route('/api/player/current_game', methods=['GET'])
+def get_current_game():
+    """获取当前唯一活跃的房间（单房间模式，玩家端无需输入房间代码）"""
+    if not current_game_id or current_game_id not in games:
+        return jsonify({"found": False})
+
+    game = games[current_game_id]
+    players = [{
+        "id": p["id"],
+        "name": p["name"],
+        "connected": p.get("connected", False)
+    } for p in game.players]
+
+    return jsonify({
+        "found": True,
+        "game_id": current_game_id,
+        "script_name": game.script["name"],
+        "players": players,
+        "player_count": game.player_count
+    })
 
 
 @player_bp.route('/api/player/join_game', methods=['POST'])
@@ -233,7 +263,11 @@ def get_player_game_state(game_id, player_id):
     
     # 检查游戏结束
     game_end = game.check_game_end() if hasattr(game, 'check_game_end') else None
-    
+
+    # "准备进入黑夜"状态（白天没人提名/提名都结算完时，全员准备好可以直接进夜）
+    alive_players_for_ready = [p for p in game.players if p.get("alive", True)]
+    ready_count = sum(1 for p in alive_players_for_ready if p.get("ready_for_night"))
+
     return jsonify({
         "players": players_public,
         "current_phase": game.current_phase,
@@ -241,6 +275,7 @@ def get_player_game_state(game_id, player_id):
         "night_number": game.night_number,
         "nominations": [{
             "id": n["id"],
+            "nominator_id": n.get("nominator_id"),
             "nominator_name": n["nominator_name"],
             "nominee_name": n["nominee_name"],
             "nominee_id": n.get("nominee_id"),
@@ -263,7 +298,13 @@ def get_player_game_state(game_id, player_id):
         "player_choice": player_choice,
         "messages": unread_messages,
         "public_log": public_log[-30:],  # 最近30条
-        "game_end": game_end
+        "game_end": game_end,
+        "current_game_id": current_game_id,
+        "ready_status": {
+            "my_ready": player.get("ready_for_night", False),
+            "ready_count": ready_count,
+            "total_alive": len(alive_players_for_ready)
+        }
     })
 
 
@@ -447,7 +488,22 @@ def player_vote():
     # 检查是否已投票
     if player_id in nomination["voters"]:
         return jsonify({"error": "你已经投过票了"}), 400
-    
+
+    # 管家投票限制：只有当主人投了赞成票时，管家才能投赞成票（管家中毒/醉酒时能力失效，不受限制）
+    # 主人的投票可能来自玩家端(votes_detail)或说书人控制台(votes)两条路径，都要检查
+    butler_affected = player.get("poisoned") or player.get("drunk")
+    if player.get("butler_master_id") and vote_value and not butler_affected:
+        master_id = player["butler_master_id"]
+        master_voted_yes = nomination["votes_detail"].get(master_id, {}).get("vote") is True
+        if not master_voted_yes:
+            master_voted_yes = any(
+                v.get("voter_id") == master_id and v.get("vote")
+                for v in nomination.get("votes", [])
+            )
+        if not master_voted_yes:
+            master_name = player.get("butler_master_name", "主人")
+            return jsonify({"error": f"管家只能在主人（{master_name}）投赞成票后才能投赞成票"}), 400
+
     # 记录投票
     nomination["voters"].append(player_id)
     nomination["votes_detail"][player_id] = {
@@ -466,12 +522,110 @@ def player_vote():
     
     vote_text = "赞成" if vote_value else "反对"
     game.add_log(f"{player['name']} 投了{vote_text}票", "vote")
-    
+
     return jsonify({
         "success": True,
         "vote_count": nomination.get("vote_count", 0),
         "total_voters": len(nomination["voters"])
     })
+
+
+# ==================== 准备进入黑夜 API ====================
+# 有些白天可能只提名一两个人甚至完全没有提名；这种情况下不用死等说书人手动点"开始夜晚"，
+# 玩家自己在手机上点"准备"，所有存活玩家都准备好后自动进夜（说书人控制台会轮询检测到）。
+
+@player_bp.route('/api/player/ready_for_night', methods=['POST'])
+def player_ready_for_night():
+    """玩家标记自己已准备好进入黑夜（可再次调用取消）"""
+    data = request.json
+    game_id = data.get('game_id')
+    player_id = data.get('player_id')
+    ready = data.get('ready', True)
+
+    if game_id not in games:
+        return jsonify({"error": "游戏不存在"}), 404
+
+    game = games[game_id]
+    player = next((p for p in game.players if p["id"] == player_id), None)
+
+    if not player:
+        return jsonify({"error": "无效的玩家"}), 400
+
+    if not player.get("alive", True):
+        return jsonify({"error": "死亡玩家不需要准备"}), 400
+
+    player["ready_for_night"] = bool(ready)
+    game.add_log(f"{player['name']} {'已准备好' if ready else '取消了准备'}进入黑夜", "info")
+
+    alive_players = [p for p in game.players if p.get("alive", True)]
+    ready_count = sum(1 for p in alive_players if p.get("ready_for_night"))
+
+    return jsonify({
+        "success": True,
+        "ready": player["ready_for_night"],
+        "ready_count": ready_count,
+        "total_alive": len(alive_players),
+        "all_ready": len(alive_players) > 0 and ready_count == len(alive_players)
+    })
+
+
+# ==================== 邪恶阵营专属聊天室 ====================
+# 只有存活的爪牙/恶魔能看到和发言，好人角色完全不知道这个聊天室的存在
+
+EVIL_CHAT_ROLE_TYPES = ("minion", "demon")
+
+
+@player_bp.route('/api/player/evil_chat/<game_id>/<int:player_id>', methods=['GET'])
+def get_evil_chat(game_id, player_id):
+    """获取邪恶阵营聊天记录"""
+    if game_id not in games:
+        return jsonify({"error": "游戏不存在"}), 404
+
+    game = games[game_id]
+    player = next((p for p in game.players if p["id"] == player_id), None)
+
+    if not player or player.get("role_type") not in EVIL_CHAT_ROLE_TYPES:
+        return jsonify({"error": "你不是邪恶阵营，无法查看这个聊天室"}), 403
+
+    return jsonify({
+        "success": True,
+        "messages": getattr(game, 'evil_chat', [])
+    })
+
+
+@player_bp.route('/api/player/evil_chat', methods=['POST'])
+def send_evil_chat():
+    """发送一条邪恶阵营聊天消息"""
+    data = request.json
+    game_id = data.get('game_id')
+    player_id = data.get('player_id')
+    text = (data.get('text') or '').strip()
+
+    if game_id not in games:
+        return jsonify({"error": "游戏不存在"}), 404
+    if not text:
+        return jsonify({"error": "消息不能为空"}), 400
+    if len(text) > 300:
+        return jsonify({"error": "消息过长"}), 400
+
+    game = games[game_id]
+    player = next((p for p in game.players if p["id"] == player_id), None)
+
+    if not player or player.get("role_type") not in EVIL_CHAT_ROLE_TYPES:
+        return jsonify({"error": "你不是邪恶阵营，无法在这个聊天室发言"}), 403
+
+    if not hasattr(game, 'evil_chat'):
+        game.evil_chat = []
+
+    game.evil_chat.append({
+        "sender_id": player_id,
+        "sender_name": player["name"],
+        "text": text,
+        "time": datetime.now().isoformat()
+    })
+    game.evil_chat = game.evil_chat[-100:]  # 只保留最近100条
+
+    return jsonify({"success": True})
 
 
 # ==================== 消息同步 API ====================

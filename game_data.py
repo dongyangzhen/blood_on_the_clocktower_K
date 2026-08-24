@@ -93,7 +93,7 @@ SCRIPTS = {
                 {
                     "id": "virgin",
                     "name": "贞洁者",
-                    "ability": "第一个成功提名你的镇民玩家会立即被处决。",
+                    "ability": "你第一次被提名时，如果提名者是镇民，他会立即被处决。",
                     "first_night": False,
                     "other_nights": False,
                     "night_order": 0

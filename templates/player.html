@@ -85,6 +85,37 @@
             text-align: center;
             margin: 1rem auto;
             max-width: 400px;
+            position: relative;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        /* 默认隐藏身份内容，点击卡片才显示，防止旁边的人偷看 */
+        .role-hidden-overlay {
+            display: none;
+            position: absolute;
+            inset: 0;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            background: rgba(0, 0, 0, 0.75);
+            border-radius: var(--radius-lg);
+            color: var(--text-secondary);
+            font-size: 1rem;
+            z-index: 2;
+        }
+
+        .role-hidden-icon {
+            font-size: 2.5rem;
+        }
+
+        .role-card-large.role-hidden .role-hidden-overlay {
+            display: flex;
+        }
+
+        .role-card-large.role-hidden .role-details {
+            filter: blur(14px);
         }
         
         .role-card-large .role-icon {
@@ -135,51 +166,35 @@
             to { opacity: 1; transform: translateY(0); }
         }
         
-        /* 玩家视角圆桌 */
-        .player-view-circle {
-            position: relative;
-            width: min(90vw, 600px);
-            height: min(90vw, 600px);
-            margin: 1rem auto;
-        }
-        
-        .player-seat-view {
-            position: absolute;
-            width: 70px;
-            height: 70px;
-            transform: translate(-50%, -50%);
-            background: rgba(0, 0, 0, 0.5);
-            border: 2px solid var(--color-blood);
-            border-radius: 50%;
+        /* 玩家名单 */
+        .player-roster-list {
             display: flex;
-            flex-direction: column;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .player-roster-item {
+            display: flex;
             align-items: center;
-            justify-content: center;
-            transition: all 0.3s ease;
+            gap: 0.4rem;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--color-blood);
+            border-radius: var(--radius-md);
+            padding: 0.4rem 0.7rem;
+            font-size: 0.85rem;
         }
-        
-        .player-seat-view.self {
+
+        .player-roster-item.self {
             border-color: var(--color-gold);
-            box-shadow: 0 0 20px rgba(212, 175, 55, 0.5);
         }
-        
-        .player-seat-view.dead {
+
+        .player-roster-item.dead {
             opacity: 0.5;
-            background: rgba(50, 50, 50, 0.5);
         }
-        
-        .player-seat-view .seat-name {
+
+        .roster-offline {
+            color: var(--text-muted);
             font-size: 0.75rem;
-            color: var(--text-primary);
-            text-align: center;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 60px;
-        }
-        
-        .player-seat-view .seat-status {
-            font-size: 1.2rem;
         }
         
         /* 游戏状态面板 */
@@ -376,23 +391,52 @@
             color: var(--color-gold);
         }
 
+        /* 邪恶阵营聊天室 */
+        .evil-chat-panel {
+            border-color: var(--color-demon, #c0392b);
+        }
+
+        .evil-chat-messages {
+            max-height: 220px;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: var(--radius-md);
+            padding: 0.75rem;
+            margin-bottom: 0.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+        }
+
+        .evil-chat-message {
+            font-size: 0.9rem;
+            padding: 0.4rem 0.6rem;
+            border-radius: var(--radius-sm);
+            background: rgba(192, 57, 43, 0.15);
+        }
+
+        .evil-chat-message .sender {
+            color: var(--color-demon, #e74c3c);
+            font-weight: 600;
+            margin-right: 0.4rem;
+        }
+
+        .evil-chat-input-row {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .evil-chat-input-row input {
+            flex: 1;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--color-blood);
+            border-radius: var(--radius-md);
+            padding: 0.5rem;
+            color: var(--text-primary);
+        }
+
         /* 响应式 */
         @media (max-width: 768px) {
-            .player-view-circle {
-                width: 95vw;
-                height: 95vw;
-            }
-            
-            .player-seat-view {
-                width: 50px;
-                height: 50px;
-            }
-            
-            .player-seat-view .seat-name {
-                font-size: 0.65rem;
-                max-width: 45px;
-            }
-            
             .role-card-large {
                 padding: 1.5rem;
             }
@@ -426,6 +470,8 @@
                 <div class="game-info" id="gameInfo" style="display: none;">
                     <span class="player-name-display" id="playerNameDisplay"></span>
                     <span class="phase-indicator" id="phaseIndicator"></span>
+                    <button class="btn btn-icon" id="manualRefreshBtn" title="刷新">🔄</button>
+                    <button class="btn btn-icon" id="historyBtn" title="我的信息记录">📜</button>
                 </div>
             </div>
         </header>
@@ -438,14 +484,19 @@
                     <h2>加入游戏</h2>
                 </div>
                 <div class="panel-body">
-                    <div class="setup-section">
+                    <p id="autoJoinHint" style="text-align:center; color: var(--text-muted);">正在自动加入说书人的游戏…</p>
+                    <p style="text-align:center;">
+                        <a href="#" id="manualCodeToggle" style="color: var(--text-muted); font-size: 0.85rem;">手动输入房间代码</a>
+                    </p>
+
+                    <div class="setup-section" id="gameCodeSection" style="display: none;">
                         <h3>输入游戏代码</h3>
                         <input type="text" id="gameCodeInput" class="game-code-input" placeholder="输入游戏代码" maxlength="20">
                         <button class="btn btn-primary" id="findGameBtn" style="width: 100%;">
                             <span>🔍</span> 查找游戏
                         </button>
                     </div>
-                    
+
                     <div id="playerSelectSection" style="display: none;">
                         <h3>选择你的座位</h3>
                         <div class="player-select-grid" id="playerSelectGrid">
@@ -461,14 +512,20 @@
             <!-- 游戏面板 -->
             <section id="gamePanel" class="panel game-panel" style="display: none;">
                 <div class="game-layout" style="display: block;">
-                    <!-- 角色信息 -->
+                    <!-- 角色信息（默认隐藏，点击后才显示，防止旁边的人偷看） -->
                     <div id="roleSection">
-                        <div class="role-card-large" id="roleCard">
-                            <img class="role-icon-img" id="roleIconImg" src="" style="display: none;" alt="角色图标">
-                            <div class="role-icon" id="roleIcon">❓</div>
-                            <div class="role-name" id="roleName">未知角色</div>
-                            <div class="role-type" id="roleType">未知</div>
-                            <div class="role-ability" id="roleAbility">等待说书人分配角色...</div>
+                        <div class="role-card-large role-hidden" id="roleCard" onclick="toggleRoleReveal()">
+                            <div class="role-hidden-overlay" id="roleHiddenOverlay">
+                                <span class="role-hidden-icon">🔒</span>
+                                <span>点击查看你的身份</span>
+                            </div>
+                            <div class="role-details" id="roleDetails">
+                                <img class="role-icon-img" id="roleIconImg" src="" style="display: none;" alt="角色图标">
+                                <div class="role-icon" id="roleIcon">❓</div>
+                                <div class="role-name" id="roleName">未知角色</div>
+                                <div class="role-type" id="roleType">未知</div>
+                                <div class="role-ability" id="roleAbility">等待说书人分配角色...</div>
+                            </div>
                         </div>
                     </div>
                     
@@ -484,14 +541,36 @@
                         </div>
                     </div>
                     
-                    <!-- 玩家圆桌视图 -->
+                    <!-- 提名面板 -->
+                    <div class="control-card" id="nominatePanel" style="display: none;">
+                        <h3>提名</h3>
+                        <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.5rem;">今天还没有提名过，选择一名玩家发起提名</p>
+                        <select id="nominateTargetSelect" class="form-select">
+                            <option value="">-- 选择要提名的玩家 --</option>
+                        </select>
+                        <button class="btn btn-primary" id="nominateSubmitBtn" style="width: 100%; margin-top: 0.5rem;">
+                            ⚖️ 提名
+                        </button>
+                    </div>
+
+                    <!-- 准备进入黑夜面板 -->
+                    <div class="control-card" id="readyForNightPanel" style="display: none;">
+                        <h3>准备进入黑夜</h3>
+                        <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 0.5rem;">如果今天不需要再提名了，点击准备；所有存活玩家都准备好后会自动进入黑夜</p>
+                        <p id="readyForNightStatus" style="color: var(--text-secondary); margin-bottom: 0.5rem;">0 / 0 人已准备</p>
+                        <button class="btn btn-primary" id="readyForNightBtn" style="width: 100%;">
+                            🌙 我准备好了
+                        </button>
+                    </div>
+
+                    <!-- 玩家名单（存活/死亡状态） -->
                     <div class="control-card">
-                        <h3>玩家座位</h3>
-                        <div class="player-view-circle" id="playerViewCircle">
-                            <!-- 玩家座位将由JavaScript生成 -->
+                        <h3>玩家名单</h3>
+                        <div class="player-roster-list" id="playerRosterList">
+                            <!-- 玩家名单将由JavaScript生成 -->
                         </div>
                     </div>
-                    
+
                     <!-- 投票面板 -->
                     <div class="voting-panel" id="votingPanel" style="display: none;">
                         <h3>投票</h3>
@@ -517,7 +596,17 @@
                             <!-- 夜间行动内容 -->
                         </div>
                     </div>
-                    
+
+                    <!-- 邪恶阵营专属聊天室（只有存活的爪牙/恶魔在夜晚能看到） -->
+                    <div class="control-card evil-chat-panel" id="evilChatPanel" style="display: none;">
+                        <h3>🗨️ 邪恶阵营密谈</h3>
+                        <div class="evil-chat-messages" id="evilChatMessages"></div>
+                        <div class="evil-chat-input-row">
+                            <input type="text" id="evilChatInput" placeholder="和队友商量今晚的行动…" maxlength="300">
+                            <button class="btn btn-primary" id="evilChatSendBtn">发送</button>
+                        </div>
+                    </div>
+
                     <!-- 公开日志 -->
                     <div class="control-card">
                         <h3>公开信息</h3>
@@ -578,6 +667,22 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-primary" onclick="closeModal('infoModal')">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 我的信息记录弹窗 -->
+    <div class="modal" id="historyModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>我的信息记录</h3>
+                <button class="modal-close" onclick="closeModal('historyModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="historyModalBody">
+                <p style="color: var(--text-muted); text-align: center;">加载中…</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('historyModal')">关闭</button>
             </div>
         </div>
     </div>

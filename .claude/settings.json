@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_1_1787539096/assign_random -H \"Content-Type: application/json\" -d '{\"player_names\":[\"A\",\"B\",\"C\",\"D\",\"E\"]}')",
+      "Bash(python3 -c ' *)",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_1_1787539096/generate_info -H \"Content-Type: application/json\" -d '{\"player_id\":2,\"targets\":[]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/storyteller/send_message -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539096\",\"player_id\":2,\"type\":\"night_result\",\"title\":\"洗衣妇\",\"content\":\"测试信息\"}')",
+      "Bash(curl -s http://127.0.0.1:5000/api/player/messages/game_1_1787539096/2)",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_1_1787539573/assign_random -H \"Content-Type: application/json\" -d '{\"player_names\":[\"A\",\"B\",\"C\",\"D\",\"E\"]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_1_1787539573/nominate -H \"Content-Type: application/json\" -d '{\"nominator_id\":1,\"nominee_id\":2}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/player/join_game -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539573\",\"player_id\":1}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/player/join_game -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539573\",\"player_id\":2}')",
+      "Bash(curl -s http://127.0.0.1:5000/api/player/game_state/game_1_1787539573/2)",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/player/join_game -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539573\",\"player_id\":3}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/player/join_game -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539573\",\"player_id\":4}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/player/vote -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539573\",\"player_id\":1,\"nomination_id\":1,\"vote\":true}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/player/vote -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539573\",\"player_id\":3,\"nomination_id\":1,\"vote\":true}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/player/vote -H \"Content-Type: application/json\" -d '{\"game_id\":\"game_1_1787539573\",\"player_id\":4,\"nomination_id\":1,\"vote\":true}')",
+      "WebSearch",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_1_1787540901/assign_manual -H \"Content-Type: application/json\" -d '{\"assignments\":[{\"name\":\"Mayor\",\"role_id\":\"mayor\"},{\"name\":\"WW\",\"role_id\":\"washerwoman\"},{\"name\":\"Chef\",\"role_id\":\"chef\"},{\"name\":\"Poisoner\",\"role_id\":\"poisoner\"},{\"name\":\"Imp\",\"role_id\":\"imp\"}]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_1_1787540901/start_night)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s http://127.0.0.1:5000/api/game/game_1_1787540901)",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_2_1787540943/assign_manual -H \"Content-Type: application/json\" -d '{\"assignments\":[{\"name\":\"Mayor\",\"role_id\":\"mayor\"},{\"name\":\"WW\",\"role_id\":\"washerwoman\"},{\"name\":\"Chef\",\"role_id\":\"chef\"},{\"name\":\"Poisoner\",\"role_id\":\"poisoner\"},{\"name\":\"Imp\",\"role_id\":\"imp\"}]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_2_1787540943/start_night)",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_2_1787540943/night_action -H \"Content-Type: application/json\" -d '{\"player_id\":5,\"action\":\"小恶魔\",\"target\":1,\"result\":\"击杀\",\"action_type\":\"kill\"}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_2_1787540943/mayor_substitute -H \"Content-Type: application/json\" -d '{\"substitute_id\":2}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_2_1787540943/start_day)",
+      "Bash(python3 -c \"import sys,json;d=json.load\\(sys.stdin\\);print\\('night_number',d.get\\('night_number'\\),'game_end',d.get\\('game_end'\\)\\)\")",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_3_1787540990/player_status -H \"Content-Type: application/json\" -d '{\"player_id\":1,\"status_type\":\"poisoned\",\"value\":true}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_3_1787540990/generate_info -H \"Content-Type: application/json\" -d '{\"player_id\":1,\"targets\":[]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:5000/api/game/game_3_1787540990/generate_info -H \"Content-Type: application/json\" -d '{\"player_id\":2,\"targets\":[]}')"
+    ]
+  }
+}

@@ -53,22 +53,43 @@ async function apiCall(endpoint, method = 'GET', data = null) {
 }
 
 // ==================== 初始化 ====================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     initBackground();
     initEventListeners();
-    
-    // 检查是否有保存的游戏状态
+
+    // 检查是否有保存的游戏状态（重连上一次的座位）
+    let reconnected = false;
     const savedState = localStorage.getItem('playerState');
     if (savedState) {
         try {
             const state = JSON.parse(savedState);
             if (state.gameId && state.playerId) {
-                reconnectToGame(state.gameId, state.playerId);
+                reconnected = await reconnectToGame(state.gameId, state.playerId);
             }
         } catch (e) {
             localStorage.removeItem('playerState');
         }
     }
+
+    // 单房间模式：没有可重连的存档时，自动加入说书人当前开的那一局，无需输入房间代码
+    if (!reconnected) {
+        await attemptAutoJoinCurrentGame();
+    }
+
+    startCurrentGameWatcher();
+
+    // 手机锁屏/切后台再切回来时，浏览器通常会暂停/节流后台的轮询定时器，
+    // 导致回来后界面还是旧数据。监听页面重新可见，立刻强制刷新一次，不用等下一个轮询周期。
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && playerState.gameId && playerState.playerId) {
+            pollGameState();
+        }
+    });
+    window.addEventListener('focus', () => {
+        if (playerState.gameId && playerState.playerId) {
+            pollGameState();
+        }
+    });
 });
 
 function initEventListeners() {
@@ -79,6 +100,71 @@ function initEventListeners() {
     document.getElementById('joinGameBtn').addEventListener('click', joinGame);
     document.getElementById('voteYesBtn').addEventListener('click', () => vote(true));
     document.getElementById('voteNoBtn').addEventListener('click', () => vote(false));
+    document.getElementById('nominateSubmitBtn').addEventListener('click', submitNomination);
+    document.getElementById('readyForNightBtn').addEventListener('click', toggleReadyForNight);
+
+    const historyBtn = document.getElementById('historyBtn');
+    if (historyBtn) historyBtn.addEventListener('click', showHistoryModal);
+
+    const manualRefreshBtn = document.getElementById('manualRefreshBtn');
+    if (manualRefreshBtn) {
+        manualRefreshBtn.addEventListener('click', async () => {
+            if (!playerState.gameId || !playerState.playerId) return;
+            await pollGameState();
+            showToast('已刷新');
+        });
+    }
+
+    const evilChatSendBtn = document.getElementById('evilChatSendBtn');
+    if (evilChatSendBtn) evilChatSendBtn.addEventListener('click', sendEvilChatMessage);
+    const evilChatInput = document.getElementById('evilChatInput');
+    if (evilChatInput) {
+        evilChatInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendEvilChatMessage();
+        });
+    }
+
+    const manualCodeToggle = document.getElementById('manualCodeToggle');
+    if (manualCodeToggle) {
+        manualCodeToggle.addEventListener('click', (e) => {
+            e.preventDefault();
+            document.getElementById('gameCodeSection').style.display = 'block';
+        });
+    }
+}
+
+// ==================== 单房间自动加入 ====================
+async function attemptAutoJoinCurrentGame() {
+    const result = await apiCall('/api/player/current_game');
+
+    if (result.found) {
+        playerState.gameId = result.game_id;
+        document.getElementById('gameCodeSection').style.display = 'none';
+        displayPlayerSelection(result.players);
+        return true;
+    }
+
+    // 还没有说书人开局：隐藏手动代码输入区，显示等待提示
+    document.getElementById('gameCodeSection').style.display = 'none';
+    const hint = document.getElementById('autoJoinHint');
+    if (hint) { hint.textContent = '等待说书人开始游戏…'; hint.style.display = ''; }
+    return false;
+}
+
+// 持续在后台检测房间代码/新局，覆盖"还没加入"和"已经在游戏中但说书人重开了新局"两种情况
+function startCurrentGameWatcher() {
+    setInterval(async () => {
+        // 已经在游戏面板里时，切局检测交给 pollGameState 里的 current_game_id 比对，这里跳过避免重复请求
+        if (playerState.gameId && playerState.playerId) return;
+
+        const result = await apiCall('/api/player/current_game');
+        if (result.found && result.game_id !== playerState.gameId) {
+            playerState.gameId = result.game_id;
+            closeModal('infoModal');
+            document.getElementById('gameCodeSection').style.display = 'none';
+            displayPlayerSelection(result.players);
+        }
+    }, 4000);
 }
 
 // ==================== 背景效果 ====================
@@ -176,6 +262,9 @@ function displayPlayerSelection(players) {
     
     grid.innerHTML = html;
     section.style.display = 'block';
+
+    const hint = document.getElementById('autoJoinHint');
+    if (hint) hint.style.display = 'none';
 }
 
 let selectedPlayerId = null;
@@ -226,12 +315,12 @@ async function reconnectToGame(gameId, playerId) {
         game_id: gameId,
         player_id: playerId
     });
-    
+
     if (result.error || !result.success) {
         localStorage.removeItem('playerState');
-        return;
+        return false;
     }
-    
+
     playerState.gameId = gameId;
     playerState.playerId = playerId;
     playerState.playerName = result.player_name;
@@ -242,10 +331,11 @@ async function reconnectToGame(gameId, playerId) {
     playerState.dayNumber = result.day_number;
     playerState.nightNumber = result.night_number;
     playerState.players = result.players;
-    
+
     showGamePanel();
     startPolling();
     startHeartbeat();
+    return true;
 }
 
 function saveState() {
@@ -349,6 +439,25 @@ function updateRoleCard() {
     document.getElementById('roleAbility').textContent = role.ability || '无特殊能力';
 }
 
+// 角色卡片默认隐藏，点击后显示，几秒后自动重新隐藏，防止旁边的人偷看
+let roleRevealTimer = null;
+
+function toggleRoleReveal() {
+    const card = document.getElementById('roleCard');
+    if (!card) return;
+
+    if (card.classList.contains('role-hidden')) {
+        card.classList.remove('role-hidden');
+        clearTimeout(roleRevealTimer);
+        roleRevealTimer = setTimeout(() => {
+            card.classList.add('role-hidden');
+        }, 8000);
+    } else {
+        card.classList.add('role-hidden');
+        clearTimeout(roleRevealTimer);
+    }
+}
+
 // ==================== 轮询更新 ====================
 function startPolling() {
     playerState.pollInterval = setInterval(pollGameState, 2000);
@@ -371,6 +480,37 @@ function startHeartbeat() {
     }, 5000);
 }
 
+function stopHeartbeat() {
+    if (playerState.heartbeatInterval) {
+        clearInterval(playerState.heartbeatInterval);
+        playerState.heartbeatInterval = null;
+    }
+}
+
+// 说书人开了新局：清空旧会话，自动跳回选座界面加入新局
+async function switchToNewGame() {
+    stopPolling();
+    stopHeartbeat();
+    localStorage.removeItem('playerState');
+
+    playerState.gameId = null;
+    playerState.playerId = null;
+    playerState.role = null;
+    playerState.roleType = null;
+    playerState.messages = [];
+    playerState.hasActiveMessage = false;
+
+    document.getElementById('gamePanel').style.display = 'none';
+    document.getElementById('gameInfo').style.display = 'none';
+    document.getElementById('joinPanel').style.display = 'block';
+    document.getElementById('playerSelectSection').style.display = 'none';
+    const hint = document.getElementById('autoJoinHint');
+    if (hint) { hint.textContent = '说书人已开始新游戏，正在重新加入…'; hint.style.display = ''; }
+
+    showToast('说书人已开始新游戏，正在重新加入…');
+    await attemptAutoJoinCurrentGame();
+}
+
 async function pollGameState() {
     if (!playerState.gameId || !playerState.playerId) return;
     
@@ -380,13 +520,20 @@ async function pollGameState() {
         console.error('获取游戏状态失败:', result.error);
         return;
     }
-    
+
+    // 单房间模式：说书人重开了新局，当前连着的是已作废的旧局，自动切换到新局
+    if (result.current_game_id && result.current_game_id !== playerState.gameId) {
+        await switchToNewGame();
+        return;
+    }
+
     // 更新状态
     playerState.players = result.players;
     playerState.currentPhase = result.current_phase;
     playerState.dayNumber = result.day_number;
     playerState.nightNumber = result.night_number;
     playerState.nominations = result.nominations || [];
+    playerState.readyStatus = result.ready_status || null;
     playerState.alive = result.my_status?.alive ?? true;
     playerState.hasVoteToken = result.my_status?.vote_token ?? true;
     playerState.nightAction = result.night_action;
@@ -601,42 +748,180 @@ function updateGameState() {
     document.getElementById('dayNumber').textContent = playerState.dayNumber || 0;
     const aliveCount = playerState.players.filter(p => p.alive).length;
     document.getElementById('aliveCount').textContent = aliveCount;
+
+    updateNominatePanel();
+    updateReadyForNightPanel();
+    updateEvilChatVisibility();
+}
+
+// ==================== 邪恶阵营聊天室 ====================
+let evilChatVisible = false;
+
+function updateEvilChatVisibility() {
+    const panel = document.getElementById('evilChatPanel');
+    if (!panel) return;
+
+    const isEvil = playerState.roleType === 'minion' || playerState.roleType === 'demon';
+    const shouldShow = isEvil && playerState.alive && playerState.currentPhase === 'night';
+
+    panel.style.display = shouldShow ? 'block' : 'none';
+    evilChatVisible = shouldShow;
+
+    // updateGameState() 本来就是每次轮询（约2秒一次）都会调用，顺带刷新聊天记录，不用额外开定时器
+    if (shouldShow) {
+        pollEvilChat();
+    }
+}
+
+async function pollEvilChat() {
+    if (!evilChatVisible || !playerState.gameId || !playerState.playerId) return;
+
+    const result = await apiCall(`/api/player/evil_chat/${playerState.gameId}/${playerState.playerId}`);
+    if (result.success) {
+        renderEvilChat(result.messages || []);
+    }
+}
+
+function renderEvilChat(messages) {
+    const container = document.getElementById('evilChatMessages');
+    if (!container) return;
+
+    container.innerHTML = messages.map(msg => `
+        <div class="evil-chat-message">
+            <span class="sender">${msg.sender_name}:</span>${msg.text}
+        </div>
+    `).join('') || '<div style="color: var(--text-muted); font-size: 0.85rem;">还没有人说话，商量一下今晚怎么行动吧</div>';
+
+    container.scrollTop = container.scrollHeight;
+}
+
+async function sendEvilChatMessage() {
+    const input = document.getElementById('evilChatInput');
+    const text = input.value.trim();
+    if (!text) return;
+
+    const result = await apiCall('/api/player/evil_chat', 'POST', {
+        game_id: playerState.gameId,
+        player_id: playerState.playerId,
+        text
+    });
+
+    if (!result.success) {
+        showInfo(result.error || '发送失败');
+        return;
+    }
+
+    input.value = '';
+    pollEvilChat();
+}
+
+function updateReadyForNightPanel() {
+    const panel = document.getElementById('readyForNightPanel');
+    if (!panel) return;
+
+    const canShow = playerState.currentPhase === 'day' && playerState.alive;
+    panel.style.display = canShow ? 'block' : 'none';
+    if (!canShow) return;
+
+    const status = playerState.readyStatus || { my_ready: false, ready_count: 0, total_alive: 0 };
+    document.getElementById('readyForNightStatus').textContent = `${status.ready_count} / ${status.total_alive} 人已准备`;
+
+    const btn = document.getElementById('readyForNightBtn');
+    btn.textContent = status.my_ready ? '✓ 已准备（点击取消）' : '🌙 我准备好了';
+    btn.classList.toggle('btn-secondary', status.my_ready);
+    btn.classList.toggle('btn-primary', !status.my_ready);
+}
+
+async function toggleReadyForNight() {
+    const currentlyReady = playerState.readyStatus?.my_ready || false;
+    const result = await apiCall('/api/player/ready_for_night', 'POST', {
+        game_id: playerState.gameId,
+        player_id: playerState.playerId,
+        ready: !currentlyReady
+    });
+
+    if (!result.success) {
+        showInfo(result.error || '操作失败');
+        return;
+    }
+
+    playerState.readyStatus = {
+        my_ready: result.ready,
+        ready_count: result.ready_count,
+        total_alive: result.total_alive
+    };
+    updateReadyForNightPanel();
+}
+
+function updateNominatePanel() {
+    const panel = document.getElementById('nominatePanel');
+    if (!panel) return;
+
+    const nominations = playerState.nominations || [];
+    const alreadyNominated = nominations.some(n => n.nominator_id === playerState.playerId);
+    const dailyLimitReached = nominations.length >= 3;
+    const canNominate = playerState.currentPhase === 'day' && playerState.alive && !alreadyNominated && !dailyLimitReached;
+
+    panel.style.display = canNominate ? 'block' : 'none';
+    if (!canNominate) return;
+
+    const select = document.getElementById('nominateTargetSelect');
+    const currentValue = select.value;
+    select.innerHTML = '<option value="">-- 选择要提名的玩家 --</option>' +
+        playerState.players
+            .filter(p => p.id !== playerState.playerId)
+            .map(p => `<option value="${p.id}">${p.name}${p.alive ? '' : ' (已死亡)'}</option>`).join('');
+    if (currentValue) select.value = currentValue;
+}
+
+async function submitNomination() {
+    const select = document.getElementById('nominateTargetSelect');
+    const nomineeId = parseInt(select.value);
+    if (!nomineeId) {
+        showInfo('请选择要提名的玩家');
+        return;
+    }
+
+    const result = await apiCall(`/api/game/${playerState.gameId}/nominate`, 'POST', {
+        nominator_id: playerState.playerId,
+        nominee_id: nomineeId
+    });
+
+    if (!result.success) {
+        showInfo(result.error || '提名失败');
+        return;
+    }
+
+    if (result.virgin_triggered) {
+        showInfo(`⚡ 贞洁者能力触发！${result.executed_player} 是镇民，立即被处决！`, '贞洁者');
+    } else {
+        showToast('提名已提交');
+    }
+
+    document.getElementById('nominatePanel').style.display = 'none';
 }
 
 function updatePlayerCircle() {
-    const container = document.getElementById('playerViewCircle');
+    const container = document.getElementById('playerRosterList');
+    if (!container) return;
     const players = playerState.players;
-    const count = players.length;
-    
-    if (count === 0) return;
-    
-    const containerRect = container.getBoundingClientRect();
-    const size = Math.min(containerRect.width, containerRect.height) || 300;
-    const radius = size * 0.38;
-    const centerX = size / 2;
-    const centerY = size / 2;
-    
-    let html = '';
-    players.forEach((player, index) => {
-        const angle = (index / count) * 2 * Math.PI - Math.PI / 2;
-        const x = centerX + radius * Math.cos(angle);
-        const y = centerY + radius * Math.sin(angle);
-        
+
+    if (players.length === 0) return;
+
+    container.innerHTML = players.map(player => {
         const isSelf = player.id === playerState.playerId;
         const isDead = !player.alive;
         const isOnline = player.connected;
-        
-        html += `
-            <div class="player-seat-view ${isSelf ? 'self' : ''} ${isDead ? 'dead' : ''}"
-                 style="left: ${x}px; top: ${y}px;"
-                 title="${player.name}${isSelf ? ' (你)' : ''}${isOnline ? '' : ' (离线)'}">
-                <div class="seat-status">${isDead ? '💀' : (isSelf ? '⭐' : (isOnline ? '👤' : '👻'))}</div>
-                <div class="seat-name">${player.name}</div>
+        const statusIcon = isDead ? '💀' : (isSelf ? '⭐' : (isOnline ? '👤' : '👻'));
+
+        return `
+            <div class="player-roster-item ${isSelf ? 'self' : ''} ${isDead ? 'dead' : ''}">
+                <span class="roster-icon">${statusIcon}</span>
+                <span class="roster-name">${player.name}${isSelf ? ' (你)' : ''}</span>
+                ${!isOnline ? '<span class="roster-offline">离线</span>' : ''}
             </div>
         `;
-    });
-    
-    container.innerHTML = html;
+    }).join('');
 }
 
 function updatePublicLog(logs) {
@@ -731,13 +1016,22 @@ let currentPendingAction = null;
 // ==================== 白天行动 ====================
 
 // 检查白天行动（如杀手）
+let notifiedDayActionRole = null;
+
 async function checkDayAction() {
     if (!playerState.gameId || !playerState.playerId) return;
-    
+
     const result = await apiCall(`/api/player/day_action/${playerState.gameId}/${playerState.playerId}`);
-    
+
     if (result.has_pending && result.action) {
+        const actionKey = result.action.role_id || result.action.role_name;
+        if (notifiedDayActionRole !== actionKey) {
+            notifiedDayActionRole = actionKey;
+            notifyMyTurn();
+        }
         showDayActionPanel(result.action);
+    } else {
+        notifiedDayActionRole = null;
     }
 }
 
@@ -842,6 +1136,20 @@ async function submitDayAction(skip = false) {
 let currentPendingActionId = null;
 
 // 检查是否有说书人发送的待处理行动，返回是否有活跃的待处理行动UI
+// 轮到自己行动时，只在自己手机上震动+响一声提示——不说角色名、不经过控制台音箱，
+// 这样即使大家都闭着眼，也只有本人（和贴身的人）可能注意到，不会向全场暴露"谁在行动"
+function notifyMyTurn() {
+    try {
+        if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+    } catch (e) { /* 部分浏览器（如 iOS Safari）不支持震动，忽略 */ }
+
+    try {
+        const chime = new Audio('/static/audio/sfx/turn.mp3');
+        chime.volume = 0.6;
+        chime.play().catch(() => {}); // 音频文件是用户自行放置的，没有就静默跳过
+    } catch (e) { /* 忽略 */ }
+}
+
 async function checkPendingAction() {
     if (!playerState.gameId || !playerState.playerId) return false;
     
@@ -861,7 +1169,8 @@ async function checkPendingAction() {
         
         currentPendingAction = result.action;
         currentPendingActionId = actionId;
-        
+        notifyMyTurn(); // 只在自己手机上震动+响一声，不广播角色名，避免暴露给旁边的人
+
         // 根据行动类型显示不同界面
         if (result.action.config?.special === 'pit_hag') {
             showPitHagAction(result.action);
@@ -1427,6 +1736,43 @@ function updateConnectionStatus(connected) {
     }
 }
 
+// ==================== 我的信息记录 ====================
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+async function showHistoryModal() {
+    const body = document.getElementById('historyModalBody');
+    body.innerHTML = '<p style="color: var(--text-muted); text-align: center;">加载中…</p>';
+    openModal('historyModal');
+
+    if (!playerState.gameId || !playerState.playerId) return;
+
+    const result = await apiCall(`/api/player/messages/${playerState.gameId}/${playerState.playerId}`);
+    const messages = result.messages || [];
+
+    if (messages.length === 0) {
+        body.innerHTML = '<p style="color: var(--text-muted); text-align: center;">暂无收到过的信息</p>';
+        return;
+    }
+
+    const sorted = [...messages].sort((a, b) => new Date(b.time) - new Date(a.time));
+    body.innerHTML = sorted.map(msg => {
+        const time = new Date(msg.time).toLocaleString();
+        return `
+            <div style="padding: var(--spacing-sm) 0; border-bottom: 1px solid rgba(255,255,255,0.1);">
+                <div style="display:flex; justify-content:space-between; color: var(--text-muted); font-size: 0.8rem;">
+                    <span>${escapeHtml(msg.title || '')}</span>
+                    <span>${time}</span>
+                </div>
+                <div style="color: var(--text-primary); margin-top: 4px;">${escapeHtml(msg.content || '')}</div>
+            </div>
+        `;
+    }).join('');
+}
+
 function showInfo(message, title = '提示') {
     document.getElementById('infoModalTitle').textContent = title;
     document.getElementById('infoModalBody').innerHTML = message;
@@ -1455,6 +1801,7 @@ async function checkRavenkeeperTrigger() {
         
         if (result.triggered && !result.already_chosen && !playerState.ravenkeeperTriggered) {
             playerState.ravenkeeperTriggered = true;
+            notifyMyTurn();
             showRavenkeeperPanel(result.targets);
         } else if (result.triggered && result.already_chosen && !playerState.ravenkeeperDismissed) {
             showRavenkeeperResult(result.result);
@@ -1695,20 +2042,6 @@ function selectTargetByName(name) {
         }
     }
 }
-
-// 在收到说书人信息时自动朗读
-const originalHandleNewMessages = handleNewMessages;
-handleNewMessages = function(messages) {
-    originalHandleNewMessages(messages);
-    messages.forEach(msg => {
-        if (msg.type === 'night_result' || msg.type === 'info') {
-            if (voiceState.ttsEnabled) {
-                const plainText = msg.content.replace(/<[^>]*>/g, '');
-                speakText(plainText);
-            }
-        }
-    });
-};
 
 // ==================== 服务器连接接口 ====================
 

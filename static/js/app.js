@@ -17,12 +17,91 @@ let gameState = {
 let scripts = [];
 let roleDistribution = {};
 
+// ===== 语音/计时设置 =====
+const DEFAULT_SETTINGS = {
+    ttsEnabled: true,
+    bgmEnabled: true,
+    bgmVolume: 0.4,
+    sfxEnabled: true,
+    sfxVolume: 0.6,
+    nightTimerEnabled: true,
+    nightTimerSeconds: 45,
+    dayTimerMinutes: 5,
+    voteTimerEnabled: true,
+    voteTimerSeconds: 20,
+    autoAdvanceToDay: true,
+    autoPilotEnabled: true
+};
+let gameSettings = { ...DEFAULT_SETTINGS };
+
+function loadSettings() {
+    try {
+        const saved = JSON.parse(localStorage.getItem('botc_settings') || '{}');
+        gameSettings = { ...DEFAULT_SETTINGS, ...saved };
+    } catch (e) {
+        gameSettings = { ...DEFAULT_SETTINGS };
+    }
+    AudioManager.updateSettings(gameSettings);
+}
+
+function saveSettings() {
+    localStorage.setItem('botc_settings', JSON.stringify(gameSettings));
+    AudioManager.updateSettings(gameSettings);
+}
+
+function initSettingsPanel() {
+    document.getElementById('setTtsEnabled').checked = gameSettings.ttsEnabled;
+    document.getElementById('setBgmEnabled').checked = gameSettings.bgmEnabled;
+    document.getElementById('setBgmVolume').value = gameSettings.bgmVolume;
+    document.getElementById('setSfxEnabled').checked = gameSettings.sfxEnabled;
+    document.getElementById('setSfxVolume').value = gameSettings.sfxVolume;
+    document.getElementById('setNightTimerEnabled').checked = gameSettings.nightTimerEnabled;
+    document.getElementById('setNightTimerSeconds').value = gameSettings.nightTimerSeconds;
+    document.getElementById('setDayTimerMinutes').value = gameSettings.dayTimerMinutes;
+    document.getElementById('setVoteTimerEnabled').checked = gameSettings.voteTimerEnabled;
+    document.getElementById('setVoteTimerSeconds').value = gameSettings.voteTimerSeconds;
+    document.getElementById('setAutoAdvanceToDay').checked = gameSettings.autoAdvanceToDay;
+    document.getElementById('setAutoPilotEnabled').checked = gameSettings.autoPilotEnabled;
+
+    document.getElementById('settingsBtn').addEventListener('click', () => {
+        showModal('settingsModal');
+    });
+
+    const bindCheckbox = (id, key) => {
+        document.getElementById(id).addEventListener('change', (e) => {
+            gameSettings[key] = e.target.checked;
+            saveSettings();
+        });
+    };
+    const bindNumber = (id, key, parser = parseFloat) => {
+        document.getElementById(id).addEventListener('change', (e) => {
+            gameSettings[key] = parser(e.target.value);
+            saveSettings();
+        });
+    };
+
+    bindCheckbox('setTtsEnabled', 'ttsEnabled');
+    bindCheckbox('setBgmEnabled', 'bgmEnabled');
+    bindNumber('setBgmVolume', 'bgmVolume');
+    bindCheckbox('setSfxEnabled', 'sfxEnabled');
+    bindNumber('setSfxVolume', 'sfxVolume');
+    bindCheckbox('setNightTimerEnabled', 'nightTimerEnabled');
+    bindNumber('setNightTimerSeconds', 'nightTimerSeconds', parseInt);
+    bindNumber('setDayTimerMinutes', 'dayTimerMinutes', parseInt);
+    bindCheckbox('setVoteTimerEnabled', 'voteTimerEnabled');
+    bindNumber('setVoteTimerSeconds', 'voteTimerSeconds', parseInt);
+    bindCheckbox('setAutoAdvanceToDay', 'autoAdvanceToDay');
+    bindCheckbox('setAutoPilotEnabled', 'autoPilotEnabled');
+}
+
 // ===== 初始化 =====
 document.addEventListener('DOMContentLoaded', () => {
     initializeApp();
 });
 
 async function initializeApp() {
+    loadSettings();
+    initSettingsPanel();
     await loadScripts();
     setupEventListeners();
     updatePlayerInputs();
@@ -110,6 +189,10 @@ function setupEventListeners() {
     
     // 处决
     document.getElementById('executeBtn').addEventListener('click', handleExecute);
+
+    // 讨论计时
+    document.getElementById('discussionTimerStartBtn').addEventListener('click', startDiscussionTimer);
+    document.getElementById('discussionTimerResetBtn').addEventListener('click', resetDiscussionTimerUI);
 }
 
 function updatePlayerInputs() {
@@ -350,6 +433,8 @@ async function handleManualAssign() {
 
 // ===== 游戏开始 =====
 async function startGame() {
+    AudioManager.unlock();
+
     // 隐藏设置面板，显示游戏面板
     document.getElementById('setupPanel').style.display = 'none';
     document.getElementById('gamePanel').style.display = 'block';
@@ -382,6 +467,11 @@ async function startGame() {
     setTimeout(() => {
         checkFortuneTellerSetup();
     }, 300);
+
+    // 分配完角色后提醒玩家查看角色；夜晚由说书人在控制台点"开始夜晚"手动开始，不自动进入
+    if (gameSettings.autoPilotEnabled) {
+        AudioManager.speak('请查看你的角色');
+    }
 }
 
 // 更新日期: 2026-01-12 - 显示游戏代码供玩家加入
@@ -474,6 +564,11 @@ async function checkFortuneTellerSetup() {
     const fortuneTeller = gameState.players.find(p => p.role && p.role.id === 'fortune_teller');
     console.log('检查占卜师:', fortuneTeller); // 调试日志
     if (fortuneTeller) {
+        // 自动驾驶模式：后端已经随机分配了有效的红鲱鱼，跳过人工确认弹窗，避免卡住自动进夜
+        if (gameSettings.autoPilotEnabled) {
+            console.log('自动驾驶模式：使用后端随机分配的红鲱鱼，跳过确认弹窗');
+            return;
+        }
         // 显示红鲱鱼设置弹窗
         console.log('显示红鲱鱼设置弹窗');
         showRedHerringModal();
@@ -815,6 +910,8 @@ function renderPlayerCircle() {
     const centerPercent = 50;
     
     gameState.players.forEach((player, index) => {
+      try {
+        console.debug('[renderPlayerCircle] seat', index, player.name, 'role=', player.role);
         const angle = (index / gameState.players.length) * 2 * Math.PI - Math.PI / 2;
         const xPercent = centerPercent + radiusPercent * Math.cos(angle);
         const yPercent = centerPercent + radiusPercent * Math.sin(angle);
@@ -873,6 +970,9 @@ function renderPlayerCircle() {
                 ${tooltipContent}
             </button>
         `;
+      } catch (e) {
+        console.error('[renderPlayerCircle] 渲染座位失败', player, e);
+      }
     });
     
     // 初始化点击事件和自定义 tooltip
@@ -947,17 +1047,39 @@ function updatePlayerSelects() {
 }
 
 // ===== 阶段控制 =====
+// 把邪恶阵营（存活的爪牙+恶魔）的夜间行动合并成相邻的一组，方便让他们同时行动+商量，
+// 而不是按官方夜序分散在不同位置各自单独行动。只重排前端展示/编排顺序，不改后端夜序生成逻辑。
+function groupEvilNightOrder(nightOrder) {
+    const evilEntries = nightOrder.filter(item => item.role_type === 'minion' || item.role_type === 'demon');
+    if (evilEntries.length < 2) return nightOrder; // 只有一个邪恶角色时没什么好"同时"的，走原顺序
+
+    const others = nightOrder.filter(item => !evilEntries.includes(item));
+    const minEvilOrder = Math.min(...evilEntries.map(item => item.order));
+    let insertIdx = others.findIndex(item => item.order > minEvilOrder);
+    if (insertIdx === -1) insertIdx = others.length;
+
+    evilEntries.forEach(item => { item.simultaneousGroup = 'evil'; });
+
+    return [...others.slice(0, insertIdx), ...evilEntries, ...others.slice(insertIdx)];
+}
+
 async function startNight() {
     const result = await apiCall(`/api/game/${gameState.gameId}/start_night`, 'POST');
-    
+
     if (!result.success) {
         alert(result.error || '开始夜晚失败');
         return;
     }
-    
+
+    // 镇长胜利条件触发：只剩3人存活且今天无人被处决
+    if (result.game_end && result.game_end.ended) {
+        showGameEnd(result.game_end);
+        return;
+    }
+
     gameState.currentPhase = 'night';
     gameState.nightNumber = result.night_number;
-    gameState.nightOrder = result.night_order;
+    gameState.nightOrder = groupEvilNightOrder(result.night_order);
     gameState.currentNightIndex = 0;
     gameState.alivePlayers = result.alive_players || [];
     
@@ -982,7 +1104,11 @@ async function startNight() {
     document.getElementById('startDayBtn').disabled = false;
     
     addLogEntry(`第 ${gameState.nightNumber} 个夜晚开始`, 'phase');
-    
+
+    AudioManager.playBgm('night');
+    AudioManager.playSfx('phase');
+    AudioManager.speak(`第 ${gameState.nightNumber} 夜降临，天黑请闭眼`);
+
     // 更新日期: 2026-01-12 - 自动通知第一位玩家行动
     if (gameState.nightOrder.length > 0) {
         await notifyNextPlayerAction(0);
@@ -1005,9 +1131,53 @@ function renderNightOrder() {
             <div class="night-order-info">
                 <div class="night-order-name">${item.player_name}</div>
                 <div class="night-order-role">${item.role_name}: ${item.ability.substring(0, 50)}...</div>
+                ${index === gameState.currentNightIndex ? `<span class="night-timer-badge" id="nightTimerBadge"></span>` : ''}
             </div>
         </div>
     `).join('');
+}
+
+// ===== 夜间行动计时器（只提醒，不自动跳过玩家的操作） =====
+// 玩家需要实际操作的行动（刀人/下毒/保护等）不能因为超时就被系统代为跳过——
+// 计时器归零只是一个提醒（音效+语音+重新计时继续等），真正推进靠玩家在手机上提交选择
+// （由 startNightChoicePolling 检测到后自动落地），或说书人在控制台手动处理。
+let nightTurnTimerInterval = null;
+let nightTurnTimerRemaining = 0;
+
+function clearNightTurnTimer() {
+    if (nightTurnTimerInterval) {
+        clearInterval(nightTurnTimerInterval);
+        nightTurnTimerInterval = null;
+    }
+}
+
+function startNightTurnTimer(index) {
+    clearNightTurnTimer();
+    if (!gameSettings.nightTimerEnabled) return;
+
+    nightTurnTimerRemaining = gameSettings.nightTimerSeconds;
+    const updateBadge = () => {
+        const badge = document.getElementById('nightTimerBadge');
+        if (badge) badge.textContent = `⏱ ${nightTurnTimerRemaining}s`;
+    };
+    updateBadge();
+
+    nightTurnTimerInterval = setInterval(() => {
+        // 说书人可能已经手动处理完毕，或玩家的选择已经被自动落地，停止提醒
+        if (gameState.currentNightIndex !== index) {
+            clearNightTurnTimer();
+            return;
+        }
+
+        nightTurnTimerRemaining -= 1;
+        updateBadge();
+        if (nightTurnTimerRemaining <= 0) {
+            AudioManager.playSfx('timer_end');
+            AudioManager.speak('还在等待玩家操作，请尽快完成');
+            addLogEntry('⏱ 超时提醒：仍在等待该角色完成行动', 'info');
+            nightTurnTimerRemaining = gameSettings.nightTimerSeconds; // 重新计时，持续提醒直到玩家实际提交
+        }
+    }, 1000);
 }
 
 // 当前夜间行动的全局变量
@@ -1016,6 +1186,8 @@ let currentNightActionTarget = null;
 let currentNightActionSecondTarget = null;
 
 async function handleNightAction(index) {
+    clearNightTurnTimer();
+
     const item = gameState.nightOrder[index];
     currentNightActionIndex = index;
     currentNightActionTarget = null;
@@ -2122,10 +2294,11 @@ async function generateInfoForTarget() {
 
 async function skipNightAction(index) {
     const item = gameState.nightOrder[index];
-    
+
+    clearNightTurnTimer();
     stopNightChoicePolling();
     stopModalChoicePolling();
-    
+
     // 记录跳过的行动
     await apiCall(`/api/game/${gameState.gameId}/night_action`, 'POST', {
         player_id: item.player_id,
@@ -2144,17 +2317,19 @@ async function skipNightAction(index) {
     gameState.currentNightIndex = index + 1;
     renderNightOrder();
     closeModal('infoModal');
-    
+    AudioManager.playSfx('turn'); // 只播提示音，不念角色名，避免向全场暴露谁在行动
+
     addLogEntry(`${item.player_name} (${item.role_name}) 选择不行动`, 'night');
-    
+
     // 自动通知下一位玩家行动
     await notifyNextPlayerAction(gameState.currentNightIndex);
 }
 
 async function completeNightActionWithTarget(index) {
+    clearNightTurnTimer();
     stopNightChoicePolling();
     stopModalChoicePolling();
-    
+
     const item = gameState.nightOrder[index];
     const target = currentNightActionTarget;
     const secondTarget = currentNightActionSecondTarget;
@@ -2418,7 +2593,8 @@ async function completeNightActionWithTarget(index) {
     renderNightOrder();
     renderPlayerCircle(); // 更新玩家圈显示状态
     closeModal('infoModal');
-    
+    AudioManager.playSfx('turn'); // 只播提示音，不念角色名，避免向全场暴露谁在行动
+
     // 生成日志
     let logMessage = `${item.player_name} (${item.role_name}) 完成了夜间行动`;
     if (target) {
@@ -2436,12 +2612,41 @@ async function completeNightActionWithTarget(index) {
 // 自动通知下一位玩家行动（支持跳过离线玩家）
 async function notifyNextPlayerAction(nextIndex) {
     if (!gameState.nightOrder || nextIndex >= gameState.nightOrder.length) {
+        clearNightTurnTimer();
+        // 全部夜间角色行动已处理完毕
+        if (gameState.nightOrder && gameState.nightOrder.length > 0 && gameState.currentPhase === 'night') {
+            addLogEntry('夜间行动全部完成', 'phase');
+            if (gameSettings.autoAdvanceToDay) {
+                AudioManager.speak('夜间行动全部完成，即将进入白天');
+                setTimeout(() => {
+                    if (gameState.currentPhase === 'night') {
+                        startDay();
+                    }
+                }, 1500);
+            }
+        }
         return;
     }
-    
+
     const nextItem = gameState.nightOrder[nextIndex];
     const nextPlayer = gameState.players.find(p => p.id === nextItem.player_id);
-    
+    // 注意：这里故意不用语音播报角色名（"XX请睁眼"）——现场语音会让所有人都知道场上有哪些身份、
+    // 轮到谁在行动，这在真实规则里是说书人私下悄悄提醒当事人的，不会说给全场听。
+    // 具体到谁行动完全靠该玩家自己手机上的私密推送+震动+提示音（notifyMyTurn，只有他自己的设备会响）。
+    // 控制台日志里仍然用文字记录角色名，方便说书人自己核对。
+
+    // 邪恶阵营（爪牙+恶魔）合并成同一组同时行动，走单独的编排逻辑
+    if (nextItem.simultaneousGroup === 'evil') {
+        const groupItems = [];
+        let i = nextIndex;
+        while (i < gameState.nightOrder.length && gameState.nightOrder[i].simultaneousGroup === 'evil') {
+            groupItems.push(gameState.nightOrder[i]);
+            i++;
+        }
+        await handleEvilSimultaneousGroup(nextIndex, groupItems);
+        return;
+    }
+
     // 确定行动配置
     const actionConfig = {
         max_targets: 1,
@@ -2480,6 +2685,31 @@ async function notifyNextPlayerAction(nextIndex) {
         actionConfig.can_select = false;
     }
     
+    // 自动驾驶模式：纯信息类角色（洗衣妇/图书管理员/调查员/厨师/共情者/送葬者等）不需要任何人操作，
+    // 短暂延迟一下（给节奏留点缓冲）后直接自动生成信息、记录、推进，不等轮询也不用计时器
+    if (gameSettings.autoPilotEnabled && actionConfig.is_info) {
+        addLogEntry(`🤖 自动结算 ${nextPlayer?.name || ''} (${nextItem.role_name}) 的信息`, 'info');
+        setTimeout(async () => {
+            if (gameState.currentNightIndex !== nextIndex) return; // 已经被其它路径处理过
+            await handleNightAction(nextIndex); // 会自动调用 generate_info 并把结果预填进 infoResultText
+
+            // 把生成的信息推送到玩家手机（现有的"发送信息"弹窗从未被接入任何按钮，这里改为自动直接调用同一个后端接口）
+            const infoText = document.getElementById('infoResultText')?.value;
+            if (infoText && infoText.trim()) {
+                await apiCall('/api/storyteller/send_message', 'POST', {
+                    game_id: gameState.gameId,
+                    player_id: nextItem.player_id,
+                    type: 'night_result',
+                    title: `🌙 ${nextItem.role_name}`,
+                    content: infoText
+                });
+            }
+
+            await completeNightActionWithTarget(nextIndex);
+        }, 2000);
+        return;
+    }
+
     // 即使玩家离线也发送通知（玩家上线后会收到）
     await apiCall('/api/storyteller/notify_action', 'POST', {
         game_id: gameState.gameId,
@@ -2487,12 +2717,105 @@ async function notifyNextPlayerAction(nextIndex) {
         action_type: actionType,
         action_config: actionConfig
     });
-    
+
     const onlineStatus = nextPlayer?.online ? '' : ' (离线，等待上线)';
     addLogEntry(`📱 已通知 ${nextPlayer?.name || '玩家'} 进行行动${onlineStatus}`, 'info');
-    
+
     // 启动轮询，等待该玩家提交选择
     startNightChoicePolling(nextItem.player_id, nextIndex);
+
+    // 启动该角色的行动计时器（超时自动跳过）
+    startNightTurnTimer(nextIndex);
+}
+
+// ===== 邪恶阵营同时行动 =====
+// 投毒者/小恶魔/间谍（存活的爪牙+恶魔）一起收到通知、一起在专属聊天室商量，
+// 等真正需要选目标的人（投毒者、小恶魔；间谍没有目标可选）都提交后才一起落地结算。
+async function handleEvilSimultaneousGroup(startIndex, groupItems) {
+    clearNightTurnTimer();
+    stopNightChoicePolling();
+
+    AudioManager.speak('邪恶阵营请开始行动'); // 不点名具体角色，避免暴露场上有哪些邪恶身份
+    addLogEntry(`🗨️ 邪恶阵营同时行动：${groupItems.map(i => `${i.player_name}(${i.role_name})`).join('、')}`, 'phase');
+
+    // 同时通知组内所有人（复用单角色路径里用的同一个通知接口）
+    for (const item of groupItems) {
+        const actionConfig = {
+            max_targets: 1,
+            can_skip: true,
+            use_alive_only: true,
+            description: item.ability || ''
+        };
+        await apiCall('/api/storyteller/notify_action', 'POST', {
+            game_id: gameState.gameId,
+            player_id: item.player_id,
+            action_type: item.action_type,
+            action_config: actionConfig
+        });
+    }
+    addLogEntry(`📱 已同时通知邪恶阵营行动：${groupItems.map(i => i.player_name).join('、')}`, 'info');
+
+    // 间谍这类没有目标可选的角色不用等提交，只有真正要选目标的（投毒者/小恶魔）需要等
+    const waitingItems = groupItems.filter(item => item.action_type !== 'other');
+    if (waitingItems.length > 0) {
+        await waitForEvilGroupSubmissions(waitingItems);
+    }
+
+    // 全部到齐后，依次复用现有的单角色结算函数落地（不重新实现投毒/击杀逻辑）
+    for (const item of groupItems) {
+        const idx = gameState.nightOrder.indexOf(item);
+        await handleNightAction(idx);
+        await completeNightActionWithTarget(idx);
+    }
+
+    // 上面逐个结算会各自把 currentNightIndex 设成"自己的索引+1"，这里统一纠正成整组之后的位置，
+    // 避免组内成员乱序完成导致索引不连续
+    gameState.currentNightIndex = startIndex + groupItems.length;
+    renderNightOrder();
+
+    await notifyNextPlayerAction(gameState.currentNightIndex);
+}
+
+// 等待邪恶阵营组内所有需要选目标的人都提交——超时不强制跳过，只提醒继续等（跟其它计时器的原则一致）
+function waitForEvilGroupSubmissions(waitingItems) {
+    return new Promise((resolve) => {
+        const pending = new Set(waitingItems.map(item => item.player_id));
+        let remindCountdown = gameSettings.nightTimerEnabled ? gameSettings.nightTimerSeconds : null;
+
+        const reminderTick = remindCountdown === null ? null : setInterval(() => {
+            remindCountdown -= 1;
+            if (remindCountdown <= 0) {
+                AudioManager.playSfx('timer_end');
+                AudioManager.speak('邪恶阵营还在等待行动，请尽快完成');
+                remindCountdown = gameSettings.nightTimerSeconds;
+            }
+        }, 1000);
+
+        const stop = () => { if (reminderTick) clearInterval(reminderTick); };
+
+        const poll = async () => {
+            if (gameState.currentPhase !== 'night') { stop(); resolve(); return; }
+            try {
+                const choicesResult = await apiCall(`/api/storyteller/player_choices/${gameState.gameId}`);
+                const choices = choicesResult.choices || {};
+                for (const item of waitingItems) {
+                    const choice = choices[item.player_id];
+                    if (pending.has(item.player_id) && choice && !choice.confirmed) {
+                        pending.delete(item.player_id);
+                    }
+                }
+            } catch (e) {
+                console.error('等待邪恶阵营提交失败:', e);
+            }
+            if (pending.size === 0) {
+                stop();
+                resolve();
+            } else {
+                setTimeout(poll, 2000);
+            }
+        };
+        poll();
+    });
 }
 
 // 夜间选择轮询 - 自动检测玩家提交并通知说书人
@@ -2519,6 +2842,27 @@ function startNightChoicePolling(playerId, nightIndex) {
             if (choice && !choice.confirmed) {
                 // 玩家已提交选择 - 更新说书人界面上的提示
                 updateNightOrderWithChoice(playerId, nightIndex, choice);
+
+                // 自动驾驶模式：玩家一提交就自动落地结算，不等说书人点"使用玩家选择"
+                if (gameSettings.autoPilotEnabled && gameState.currentNightIndex === nightIndex) {
+                    clearNightTurnTimer();
+                    stopNightChoicePolling();
+                    await handleNightAction(nightIndex); // 会用玩家提交的目标自动生成信息（占卜师/守鸦人等）
+
+                    // 若该角色是信息类（如占卜师查验结果），把生成的信息推送到玩家手机
+                    const infoText = document.getElementById('infoResultText')?.value;
+                    if (infoText && infoText.trim()) {
+                        await apiCall('/api/storyteller/send_message', 'POST', {
+                            game_id: gameState.gameId,
+                            player_id: playerId,
+                            type: 'night_result',
+                            title: `🌙 ${gameState.nightOrder[nightIndex]?.role_name || ''}`,
+                            content: infoText
+                        });
+                    }
+
+                    await completeNightActionWithTarget(nightIndex);
+                }
             }
         } catch (e) {
             console.error('轮询玩家选择失败:', e);
@@ -2557,9 +2901,10 @@ function updateNightOrderWithChoice(playerId, nightIndex, choice) {
 // completeNightAction 已被 completeNightActionWithTarget 替代
 
 async function startDay() {
+    clearNightTurnTimer();
     stopNightChoicePolling();
     stopModalChoicePolling();
-    
+
     // 检查镇长替死
     const mayorCheck = await checkMayorSubstitute();
     if (mayorCheck === 'cancelled') {
@@ -2607,8 +2952,10 @@ async function startDay() {
             }
             addLogEntry(`${death.player_name} 在夜间死亡 (${death.cause})`, 'death');
         });
+        AudioManager.speak(`天亮了，昨晚有 ${result.night_deaths.length} 人死亡`);
     } else {
         addLogEntry('今晚无人死亡', 'phase');
+        AudioManager.speak('天亮了，昨晚无人死亡');
     }
     
     // 处理红唇女郎触发
@@ -2645,8 +2992,206 @@ async function startDay() {
     
     // 更新日期: 2026-01-05 - 检查并更新杀手能力状态
     await checkSlayerAbility();
-    
+
     addLogEntry(`第 ${gameState.dayNumber} 天开始`, 'phase');
+
+    AudioManager.playBgm('day');
+    AudioManager.playSfx('phase');
+    resetDiscussionTimerUI();
+    AudioManager.speak('现在开始讨论');
+
+    if (gameSettings.autoPilotEnabled) {
+        startDiscussionTimer();
+        startDayAutoPilot();
+    }
+}
+
+// ===== 白天讨论计时器 =====
+let discussionTimerInterval = null;
+let discussionTimerRemaining = 0;
+
+function resetDiscussionTimerUI() {
+    clearInterval(discussionTimerInterval);
+    discussionTimerInterval = null;
+    const display = document.getElementById('discussionTimerDisplay');
+    const startBtn = document.getElementById('discussionTimerStartBtn');
+    const resetBtn = document.getElementById('discussionTimerResetBtn');
+    if (display) display.textContent = '讨论计时：未开始';
+    if (startBtn) { startBtn.style.display = ''; startBtn.textContent = '▶ 开始讨论计时'; }
+    if (resetBtn) resetBtn.style.display = 'none';
+}
+
+function formatMMSS(totalSeconds) {
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function startDiscussionTimer() {
+    clearInterval(discussionTimerInterval);
+    discussionTimerRemaining = gameSettings.dayTimerMinutes * 60;
+
+    const display = document.getElementById('discussionTimerDisplay');
+    const startBtn = document.getElementById('discussionTimerStartBtn');
+    const resetBtn = document.getElementById('discussionTimerResetBtn');
+    if (startBtn) startBtn.style.display = 'none';
+    if (resetBtn) resetBtn.style.display = '';
+
+    const update = () => {
+        if (display) display.textContent = `讨论计时：${formatMMSS(discussionTimerRemaining)}`;
+    };
+    update();
+
+    discussionTimerInterval = setInterval(() => {
+        discussionTimerRemaining -= 1;
+        update();
+        if (discussionTimerRemaining <= 0) {
+            clearInterval(discussionTimerInterval);
+            discussionTimerInterval = null;
+            AudioManager.playSfx('timer_end');
+            AudioManager.speak('讨论时间结束，可以开始提名了');
+            if (display) display.textContent = '讨论计时：时间到';
+        }
+    }, 1000);
+}
+
+// ===== 白天自动驾驶：轮询发现新提名 / 到点自动结算投票 / 自动通知+结算杀手 =====
+let dayAutoPilotInterval = null;
+let dayAutoPilotVoteTimers = {};
+let dayAutoPilotSlayerNotified = false;
+
+function stopDayAutoPilot() {
+    if (dayAutoPilotInterval) {
+        clearInterval(dayAutoPilotInterval);
+        dayAutoPilotInterval = null;
+    }
+    Object.values(dayAutoPilotVoteTimers).forEach(t => clearInterval(t));
+    dayAutoPilotVoteTimers = {};
+    dayAutoPilotSlayerNotified = false;
+}
+
+function startDayAutoPilot() {
+    stopDayAutoPilot();
+    let pollRunning = false; // 防止上一轮轮询还没结束（比如正在 startNight()）时又叠加一轮
+
+    const poll = async () => {
+        if (!gameState.gameId || gameState.currentPhase !== 'day' || !gameSettings.autoPilotEnabled) {
+            stopDayAutoPilot();
+            return;
+        }
+        if (pollRunning) return;
+        pollRunning = true;
+
+        try {
+            const result = await apiCall(`/api/game/${gameState.gameId}`);
+            if (result && result.nominations) {
+                let changed = false;
+                for (const nom of result.nominations) {
+                    const existing = gameState.nominations.find(n => n.id === nom.id);
+                    if (!existing) {
+                        gameState.nominations.push(nom);
+                        addLogEntry(`${nom.nominator_name} 提名了 ${nom.nominee_name}`, 'nomination');
+                        AudioManager.speak(`${nom.nominator_name} 提名了 ${nom.nominee_name}`);
+                        changed = true;
+                        if (nom.status === 'voting' && !dayAutoPilotVoteTimers[nom.id]) {
+                            startAutoVoteTimer(nom.id);
+                        }
+                    } else if (existing.vote_count !== nom.vote_count || existing.status !== nom.status) {
+                        Object.assign(existing, nom);
+                        changed = true;
+                    }
+                }
+                if (changed) renderNominations();
+
+                // "准备进入黑夜"：白天可能没有提名（或提名都已结算完），不用死等说书人手动点"开始夜晚"，
+                // 全部存活玩家在手机上都点了准备、且没有正在投票中的提名时，自动进夜
+                const alivePlayers = (result.players || []).filter(p => p.alive);
+                const allReady = alivePlayers.length > 0 && alivePlayers.every(p => p.ready_for_night);
+                const hasActiveVoting = gameState.nominations.some(n => n.status === 'voting');
+                if (allReady && !hasActiveVoting && gameState.currentPhase === 'day') {
+                    addLogEntry('🌙 全部存活玩家已准备，自动进入黑夜', 'phase');
+                    await startNight();
+                    return; // startNight() 已经把阶段切走了，下一轮 poll 会自己检测到并停止
+                }
+
+                await autoPilotHandleSlayer();
+            }
+        } catch (e) {
+            console.error('白天自动驾驶轮询失败:', e);
+        } finally {
+            pollRunning = false;
+        }
+    };
+
+    poll();
+    dayAutoPilotInterval = setInterval(poll, 2500);
+}
+
+// 提名投票倒计时：不会因为超时就强行结算（那等于替还没投票的人做了决定）。
+// 只有当所有有资格投票的人（存活玩家 + 还持有弃票令牌的死亡玩家）都已经投票时才自动结算；
+// 计时器归零但还有人没投时，只提醒，重新计时继续等，复用 handleExecute 但不强推。
+function votedPlayerIds(nomination) {
+    const ids = new Set((nomination.voters || []));
+    (nomination.votes || []).forEach(v => ids.add(v.voter_id));
+    return ids;
+}
+
+function startAutoVoteTimer(nominationId) {
+    if (!gameSettings.voteTimerEnabled) return;
+
+    let remaining = gameSettings.voteTimerSeconds;
+    const interval = setInterval(async () => {
+        const nom = gameState.nominations.find(n => n.id === nominationId);
+        if (!nom || nom.status !== 'voting') {
+            clearInterval(interval);
+            delete dayAutoPilotVoteTimers[nominationId];
+            return;
+        }
+
+        const eligible = gameState.players.filter(p => p.alive || p.vote_token);
+        const voted = votedPlayerIds(nom);
+        const notVoted = eligible.filter(p => !voted.has(p.id));
+
+        if (notVoted.length === 0) {
+            // 所有有资格投票的人都投完了，不用等计时器，直接结算
+            clearInterval(interval);
+            delete dayAutoPilotVoteTimers[nominationId];
+            currentNominationId = nominationId;
+            await handleExecute();
+            return;
+        }
+
+        remaining -= 1;
+        if (remaining > 0) return;
+
+        // 超时不强制结算：只提醒还没投票的人，重新计时继续等待
+        AudioManager.playSfx('timer_end');
+        AudioManager.speak(`还有 ${notVoted.length} 人没有投票，请尽快`);
+        addLogEntry(`⏱ 投票提醒：${notVoted.map(p => p.name).join('、')} 还没投票`, 'info');
+        remaining = gameSettings.voteTimerSeconds;
+    }, 1000);
+    dayAutoPilotVoteTimers[nominationId] = interval;
+}
+
+// 杀手能力：白天开始自动通知玩家，玩家提交选择后自动结算（不弹 confirm）
+async function autoPilotHandleSlayer() {
+    const status = await apiCall(`/api/game/${gameState.gameId}/slayer_status`);
+    if (!status.has_slayer || status.ability_used) {
+        dayAutoPilotSlayerNotified = false;
+        return;
+    }
+
+    if (!dayAutoPilotSlayerNotified) {
+        dayAutoPilotSlayerNotified = true;
+        await notifySlayerAction(status.slayer_id);
+    }
+
+    const choicesResult = await apiCall(`/api/storyteller/player_choices/${gameState.gameId}`);
+    const choice = choicesResult.choices && choicesResult.choices[status.slayer_id];
+    if (choice && !choice.confirmed && choice.targets && choice.targets.length > 0) {
+        dayAutoPilotSlayerNotified = false; // 已结算，能力用掉后 slayer_status 会变，重置标记
+        await resolveSlayerAbility(status.slayer_id, choice.targets[0]);
+    }
 }
 
 // 更新日期: 2026-01-05 - 检查杀手能力状态
@@ -3067,56 +3612,71 @@ async function confirmPitHagDemon(pitHagPlayerId, allowDemonSurvive) {
 async function useSlayerAbility() {
     const slayerSection = document.getElementById('slayerAbilitySection');
     const slayerTargetSelect = document.getElementById('slayerTargetSelect');
-    
+
     const slayerId = parseInt(slayerSection.dataset.slayerId);
     const targetId = parseInt(slayerTargetSelect.value);
-    
+
     if (!targetId) {
         alert('请选择一名目标');
         return;
     }
-    
+
     const slayerName = slayerSection.dataset.slayerName;
     const targetPlayer = gameState.players.find(p => p.id === targetId);
-    
+
     if (!confirm(`确定让 ${slayerName}（杀手）选择 ${targetPlayer.name} 吗？\n\n注意：此能力仅能使用一次！`)) {
         return;
     }
-    
+
+    await resolveSlayerAbility(slayerId, targetId);
+}
+
+// 结算杀手能力（供手动确认和自动驾驶共用）
+async function resolveSlayerAbility(slayerId, targetId) {
+    const slayerSection = document.getElementById('slayerAbilitySection');
+    const targetPlayer = gameState.players.find(p => p.id === targetId);
+
     const result = await apiCall(`/api/game/${gameState.gameId}/slayer_ability`, 'POST', {
         slayer_id: slayerId,
         target_id: targetId
     });
-    
+
     if (result.success) {
         if (result.target_died) {
             addLogEntry(`🗡️ ${result.slayer_name}（杀手）选择了 ${result.target_name}，${result.target_name} 是恶魔，立即死亡！`, 'death');
-            
+            AudioManager.speak(`${result.target_name} 是恶魔，被杀手当场击杀`);
+
             // 更新本地状态
             if (targetPlayer) {
                 targetPlayer.alive = false;
             }
-            
+
             // 检查游戏结束
             if (result.game_end && result.game_end.ended) {
                 showGameEnd(result.game_end);
                 return;
             }
-            
+
             renderPlayerCircle();
             updatePlayerSelects();
         } else {
             addLogEntry(`🗡️ ${result.slayer_name}（杀手）选择了 ${result.target_name}，${result.reason || '目标不是恶魔，无事发生'}`, 'ability');
+            AudioManager.speak('目标不是恶魔，无事发生');
         }
-        
+
         // 标记本地杀手能力已使用
         const slayer = gameState.players.find(p => p.id === slayerId);
         if (slayer) {
             slayer.ability_used = true;
         }
-        
+
         // 隐藏杀手能力面板
-        slayerSection.style.display = 'none';
+        if (slayerSection) slayerSection.style.display = 'none';
+
+        await apiCall('/api/storyteller/clear_pending_action', 'POST', {
+            game_id: gameState.gameId,
+            player_id: slayerId
+        });
     } else {
         alert(result.error || '使用能力失败');
     }
@@ -3152,49 +3712,74 @@ function showMayorSubstituteModal(mayor, resolve) {
                 <div class="modal-content">
                     <h3>🏛️ 镇长能力触发</h3>
                     <p>镇长 <strong>${mayor.name}</strong> 即将被恶魔杀死</p>
-                    <p>你可以选择让另一名玩家替镇长死亡，或让镇长自己死亡</p>
+                    <p>你可以选择让另一名玩家代替镇长死亡，或让今晚无人死亡（镇长安全）</p>
                     <div class="form-group">
                         <label>选择替死的玩家：</label>
                         <select id="mayorSubstituteSelect" class="form-select">
-                            <option value="">-- 让镇长自己死亡 --</option>
+                            <option value="">-- 无人替死（今晚无人死亡）--</option>
                         </select>
                     </div>
                     <div class="modal-actions">
                         <button class="btn btn-primary" id="confirmMayorSubstitute">确认</button>
                     </div>
+                    <p id="mayorSubstituteTimeout" style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.5rem;"></p>
                 </div>
             </div>
         `;
         document.body.insertAdjacentHTML('beforeend', modalHtml);
         modal = document.getElementById('mayorSubstituteModal');
     }
-    
+
     // 更新选项
     const select = document.getElementById('mayorSubstituteSelect');
     const otherPlayers = gameState.players.filter(p => p.id !== mayor.id && p.alive);
-    select.innerHTML = '<option value="">-- 让镇长自己死亡 --</option>' + 
+    select.innerHTML = '<option value="">-- 无人替死（今晚无人死亡）--</option>' +
         otherPlayers.map(p => `<option value="${p.id}">${p.name} (${p.role?.name || '未知'})</option>`).join('');
-    
+
     modal.classList.add('active');
-    
-    document.getElementById('confirmMayorSubstitute').onclick = async () => {
-        const substituteId = select.value;
-        
+
+    let settled = false;
+    const applySubstitute = async (substituteId) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(timeoutInterval);
+
         const result = await apiCall(`/api/game/${gameState.gameId}/mayor_substitute`, 'POST', {
             substitute_id: substituteId ? parseInt(substituteId) : null
         });
-        
+
         if (result.success) {
             if (result.substitute) {
                 addLogEntry(`镇长的能力触发，${result.substitute} 替镇长死亡`, 'night');
             } else {
-                addLogEntry(`镇长选择不使用替死能力`, 'night');
+                addLogEntry(`镇长的能力触发，今晚无人死亡`, 'night');
             }
         }
-        
+
         modal.classList.remove('active');
         resolve('continue');
     };
+
+    document.getElementById('confirmMayorSubstitute').onclick = () => applySubstitute(select.value);
+
+    // 自动驾驶模式：无人操作时，超时默认"无人替死"（镇长安全，今晚无人死亡），避免卡住自动切日
+    let timeoutInterval = null;
+    const timeoutText = document.getElementById('mayorSubstituteTimeout');
+    if (gameSettings.autoPilotEnabled) {
+        let remaining = 20;
+        const update = () => { if (timeoutText) timeoutText.textContent = `🤖 自动驾驶：${remaining}秒后自动默认无人替死（今晚无人死亡）`; };
+        update();
+        timeoutInterval = setInterval(() => {
+            remaining -= 1;
+            update();
+            if (remaining <= 0) {
+                clearInterval(timeoutInterval);
+                applySubstitute(null);
+            }
+        }, 1000);
+    } else if (timeoutText) {
+        timeoutText.textContent = '';
+    }
 }
 
 // 检查守鸦人是否被触发
@@ -3232,33 +3817,64 @@ function showRavenkeeperModal(ravenkeeperPlayerId, ravenkeeperName) {
                             <button class="btn btn-primary" id="confirmRavenkeeper">确认并查看</button>
                             <button class="btn btn-secondary" id="closeRavenkeeper" style="display:none;">关闭</button>
                         </div>
+                        <p id="ravenkeeperTimeout" style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.5rem;"></p>
                     </div>
                 </div>
             `;
             document.body.insertAdjacentHTML('beforeend', modalHtml);
             modal = document.getElementById('ravenkeeperModal');
         }
-        
+
         document.getElementById('ravenkeeperPlayerName').textContent = ravenkeeperName;
-        
+
         // 更新选项
         const select = document.getElementById('ravenkeeperTargetSelect');
-        select.innerHTML = '<option value="">-- 选择玩家 --</option>' + 
+        select.innerHTML = '<option value="">-- 选择玩家 --</option>' +
             gameState.players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
-        
+
         document.getElementById('ravenkeeperInfoResult').style.display = 'none';
         document.getElementById('closeRavenkeeper').style.display = 'none';
         document.getElementById('confirmRavenkeeper').style.display = 'inline-block';
-        
+
         modal.classList.add('active');
-        
+
+        let settled = false;
+        const skipAndResolve = () => {
+            if (settled) return;
+            settled = true;
+            clearInterval(timeoutInterval);
+            modal.classList.remove('active');
+            resolve();
+        };
+
+        // 自动驾驶模式：无人操作时，超时默认跳过查验，避免卡住自动切日
+        let timeoutInterval = null;
+        const timeoutText = document.getElementById('ravenkeeperTimeout');
+        if (gameSettings.autoPilotEnabled) {
+            let remaining = 20;
+            const update = () => { if (timeoutText) timeoutText.textContent = `🤖 自动驾驶：${remaining}秒后自动跳过查验`; };
+            update();
+            timeoutInterval = setInterval(() => {
+                remaining -= 1;
+                update();
+                if (remaining <= 0) {
+                    clearInterval(timeoutInterval);
+                    skipAndResolve();
+                }
+            }, 1000);
+        } else if (timeoutText) {
+            timeoutText.textContent = '';
+        }
+
         document.getElementById('confirmRavenkeeper').onclick = async () => {
             const targetId = select.value;
             if (!targetId) {
                 alert('请选择一名玩家');
                 return;
             }
-            
+            clearInterval(timeoutInterval);
+            settled = true;
+
             // 生成守鸦人信息
             const info = await apiCall(`/api/game/${gameState.gameId}/generate_info`, 'POST', {
                 player_id: ravenkeeperPlayerId,
@@ -3395,7 +4011,7 @@ function renderNominations() {
                 ${nom.status === 'virgin_triggered' ? 
                     '<span style="color: var(--color-blood); font-size: 0.85rem;">⚡ 贞洁者能力触发</span>' :
                     `<span class="vote-count-badge">${nom.vote_count} 票</span>
-                    ${nom.status === 'pending' ? `<button class="btn btn-secondary" style="padding: 4px 8px; font-size: 0.8rem;" onclick="openVoteModal(${nom.id})">投票</button>` : ''}`
+                    ${nom.status === 'voting' ? `<button class="btn btn-secondary" style="padding: 4px 8px; font-size: 0.8rem;" onclick="openVoteModal(${nom.id})">投票</button>` : ''}`
                 }
             </div>
         </div>
@@ -3404,10 +4020,69 @@ function renderNominations() {
 
 let currentNominationId = null;
 
-function openVoteModal(nominationId) {
+// ===== 投票计时器（超时自动结算） =====
+let voteTimerInterval = null;
+let voteTimerNominationId = null;
+
+function clearVoteTimer() {
+    if (voteTimerInterval) {
+        clearInterval(voteTimerInterval);
+        voteTimerInterval = null;
+    }
+    voteTimerNominationId = null;
+    const display = document.getElementById('voteTimerDisplay');
+    if (display) display.style.display = 'none';
+}
+
+function startVoteTimer(nominationId) {
+    clearVoteTimer();
+    if (!gameSettings.voteTimerEnabled) return;
+
+    voteTimerNominationId = nominationId;
+    let remaining = gameSettings.voteTimerSeconds;
+    const display = document.getElementById('voteTimerDisplay');
+    if (display) display.style.display = '';
+
+    const update = () => {
+        if (display) display.textContent = `⏱ ${remaining}s`;
+    };
+    update();
+
+    // 超时不强制结算（会替还没投票的人做决定）：所有有资格投票的人都投完了才自动结算，
+    // 否则只提醒、重新计时继续等，跟白天自动驾驶的投票倒计时逻辑保持一致
+    voteTimerInterval = setInterval(() => {
+        const nom = gameState.nominations.find(n => n.id === nominationId);
+        if (!nom || nom.status !== 'voting') {
+            clearVoteTimer();
+            return;
+        }
+
+        const eligible = gameState.players.filter(p => p.alive || p.vote_token);
+        const notVoted = eligible.filter(p => !votedPlayerIds(nom).has(p.id));
+
+        if (notVoted.length === 0) {
+            clearInterval(voteTimerInterval);
+            voteTimerInterval = null;
+            if (currentNominationId === nominationId) {
+                handleExecute();
+            }
+            return;
+        }
+
+        remaining -= 1;
+        update();
+        if (remaining <= 0) {
+            AudioManager.playSfx('timer_end');
+            AudioManager.speak(`还有 ${notVoted.length} 人没有投票，请尽快`);
+            remaining = gameSettings.voteTimerSeconds;
+        }
+    }, 1000);
+}
+
+function openVoteModal(nominationId, resetTimer = true) {
     currentNominationId = nominationId;
     const nomination = gameState.nominations.find(n => n.id === nominationId);
-    
+
     const alivePlayers = gameState.players.filter(p => p.alive);
     const requiredVotes = Math.floor(alivePlayers.length / 2) + 1;
     
@@ -3441,6 +4116,10 @@ function openVoteModal(nominationId) {
     
     updateVoteCount(nomination);
     showModal('voteModal');
+
+    if (resetTimer && voteTimerNominationId !== nominationId) {
+        startVoteTimer(nominationId);
+    }
 }
 
 async function castVote(nominationId, voterId, vote) {
@@ -3475,8 +4154,8 @@ async function castVote(nominationId, voterId, vote) {
         voter.vote_token = false;
     }
     
-    // 刷新投票界面
-    openVoteModal(nominationId);
+    // 刷新投票界面（不重置计时器）
+    openVoteModal(nominationId, false);
 }
 
 function updateVoteCount(nomination) {
@@ -3546,7 +4225,9 @@ async function handleExecute() {
         } else {
             addLogEntry(`${nomination.nominee_name} 被处决`, 'execution');
         }
-        
+        AudioManager.playSfx('execution');
+        AudioManager.speak(`${nomination.nominee_name} 被处决`);
+
         // 检查圣徒被处决
         if (result.saint_executed) {
             addLogEntry(`⚡ 圣徒 ${nomination.nominee_name} 被处决！邪恶阵营获胜！`, 'game_end');
@@ -3564,8 +4245,9 @@ async function handleExecute() {
     } else {
         nomination.status = 'failed';
         addLogEntry(`${nomination.nominee_name} 未获得足够票数，逃过一劫`, 'execution');
+        AudioManager.speak(`${nomination.nominee_name} 未获得足够票数，逃过一劫`);
     }
-    
+
     closeModal('voteModal');
     renderNominations();
     renderPlayerCircle();
@@ -4014,7 +4696,9 @@ function showGameEnd(gameEnd) {
     const content = document.getElementById('gameEndContent');
     const winnerText = gameEnd.winner === 'good' ? '善良阵营获胜！' : '邪恶阵营获胜！';
     const winnerClass = gameEnd.winner;
-    
+
+    AudioManager.speak(`游戏结束，${winnerText}${gameEnd.reason || ''}`);
+
     content.innerHTML = `
         <div class="game-end-winner ${winnerClass}">${winnerText}</div>
         <div class="game-end-reason">${gameEnd.reason}</div>
@@ -4054,6 +4738,9 @@ function closeModal(modalId) {
     document.getElementById(modalId).classList.remove('show');
     if (modalId === 'infoModal') {
         stopModalChoicePolling();
+    }
+    if (modalId === 'voteModal') {
+        clearVoteTimer();
     }
 }
 
@@ -4435,6 +5122,41 @@ setInterval(() => {
         refreshPlayerStatus();
     }
 }, 5000);
+
+// 说书人切到别的标签页/切后台再切回来时，浏览器通常会节流后台定时器，导致回来后画面是旧的。
+// 只做纯展示层的刷新（玩家状态、提名列表），不重新触发通知/计时器，避免打扰正在进行的流程。
+async function refreshGameDisplayNow() {
+    if (!gameState.gameId || gameState.currentPhase === 'setup') return;
+    try {
+        const result = await apiCall(`/api/game/${gameState.gameId}`);
+        if (!result || result.error) return;
+
+        if (result.players) {
+            result.players.forEach(updated => {
+                const player = gameState.players.find(p => p.id === updated.id);
+                if (player) Object.assign(player, updated);
+            });
+            renderPlayerCircle();
+        }
+        if (result.nominations) {
+            result.nominations.forEach(nom => {
+                const existing = gameState.nominations.find(n => n.id === nom.id);
+                if (existing) Object.assign(existing, nom);
+                else gameState.nominations.push(nom);
+            });
+            renderNominations();
+        }
+    } catch (e) {
+        console.error('刷新画面失败:', e);
+    }
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        refreshGameDisplayNow();
+    }
+});
+window.addEventListener('focus', refreshGameDisplayNow);
 
 // 在玩家详情中添加发送消息按钮
 function addSendMessageButton(playerId, playerName) {

@@ -1078,7 +1078,8 @@ body {
     animation: fadeIn 0.3s ease;
 }
 
-.modal.show {
+.modal.show,
+.modal.active {
     display: flex;
 }
 
@@ -2469,5 +2470,95 @@ body {
 
 .glow-effect {
     animation: glow 2s ease-in-out infinite;
+}
+
+/* ===== 设置按钮 ===== */
+.btn-icon {
+    background: transparent;
+    border: 1px solid rgba(139, 0, 0, 0.4);
+    border-radius: 8px;
+    color: var(--text-primary, #eee);
+    font-size: 1.2rem;
+    width: 40px;
+    height: 40px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.btn-icon:hover {
+    border-color: var(--color-blood);
+    background: rgba(139, 0, 0, 0.15);
+}
+
+/* ===== 设置弹窗 ===== */
+.settings-body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-md, 12px);
+}
+
+.settings-row {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm, 8px);
+    flex-wrap: wrap;
+}
+
+.settings-row label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-primary, #eee);
+}
+
+.settings-slider {
+    width: 120px;
+}
+
+.settings-number {
+    width: 70px;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(139, 0, 0, 0.4);
+    border-radius: 4px;
+    color: var(--text-primary, #eee);
+    padding: 4px 6px;
+}
+
+.settings-divider {
+    border: none;
+    border-top: 1px solid rgba(139, 0, 0, 0.3);
+    margin: 4px 0;
+}
+
+/* ===== 夜间行动倒计时角标 ===== */
+.night-timer-badge {
+    display: inline-block;
+    background: rgba(139, 0, 0, 0.25);
+    border: 1px solid var(--color-blood);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 0.8rem;
+    color: var(--color-blood-light, #B22222);
+    margin-top: 4px;
+}
+
+/* ===== 白天讨论计时条 ===== */
+.discussion-timer-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-sm, 8px);
+    margin-bottom: var(--spacing-md, 12px);
+    flex-wrap: wrap;
+}
+
+.discussion-timer-display {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+}
+
+/* ===== 投票倒计时 ===== */
+#voteTimerDisplay {
+    color: var(--color-blood-light, #B22222);
+    font-weight: 600;
 }
 

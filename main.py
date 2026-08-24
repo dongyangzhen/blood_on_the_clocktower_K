@@ -3,7 +3,8 @@ import random
 import json
 from datetime import datetime
 from game_data import SCRIPTS, ROLE_TYPES, get_role_distribution, NIGHT_ORDER_PHASES, DAY_PHASES
-from player_api import player_bp, init_player_api
+from player_api import player_bp, init_player_api, set_current_game
+from tts_api import tts_bp
 
 app = Flask(__name__)
 app.secret_key = 'blood_on_the_clocktower_storyteller_secret_key_2024'
@@ -14,6 +15,9 @@ games = {}
 # 注册玩家端蓝图
 app.register_blueprint(player_bp)
 init_player_api(games)
+
+# 注册语音合成蓝图
+app.register_blueprint(tts_bp)
 
 class Game:
     def __init__(self, game_id, script_id, player_count):
@@ -46,7 +50,10 @@ class Game:
         # 更新日期: 2026-01-09 - 弄臣、月之子、莽夫追踪
         self.goon_chosen_tonight = False  # 莽夫今晚是否已被选择
         self.pending_moonchild = None  # 等待处理的月之子（死亡时触发）
-        
+        # 邪恶阵营专属聊天室（爪牙+恶魔之间商量夜间行动用，好人角色看不到）
+        self.evil_chat = []
+
+
     def to_dict(self):
         return {
             "game_id": self.game_id,
@@ -307,7 +314,11 @@ class Game:
             player.pop("ravenkeeper_triggered", None)
             player.pop("ravenkeeper_choice_made", None)
             player.pop("ravenkeeper_result", None)
-            
+            # 管家的主人是"每晚"重新选择的，不选则当晚/次日不受限制
+            player.pop("butler_master_id", None)
+            player.pop("butler_master_name", None)
+
+
             # 检查醉酒状态是否过期
             if player.get("drunk") and player.get("drunk_until"):
                 until = player["drunk_until"]
@@ -1000,7 +1011,9 @@ class Game:
         self.devils_advocate_protected = None
         for p in self.players:
             p.pop("devils_advocate_protected", None)
-        
+            p["ready_for_night"] = False  # "准备进入黑夜"状态每天重置
+
+
         # 处理恶魔击杀（考虑保护），复用守鸦人检查时的预处理结果
         if getattr(self, '_night_kills_processed', False):
             demon_deaths = getattr(self, '_pre_process_results', [])
@@ -1056,7 +1069,11 @@ class Game:
         for nom in self.nominations:
             if nom["nominator_id"] == nominator_id:
                 return {"success": False, "error": "该玩家今天已经提名过"}
-        
+
+        # 每天最多提名3次（self.nominations 在 start_day() 时会清空，所以这里的长度就是"今天"的提名数）
+        if len(self.nominations) >= 3:
+            return {"success": False, "error": "今天的提名次数已达上限（最多3次）"}
+
         nomination = {
             "id": len(self.nominations) + 1,
             "nominator_id": nominator_id,
@@ -1065,7 +1082,7 @@ class Game:
             "nominee_name": nominee["name"],
             "votes": [],
             "vote_count": 0,
-            "status": "pending"
+            "status": "voting"
         }
         
         self.nominations.append(nomination)
@@ -1075,32 +1092,40 @@ class Game:
         virgin_triggered = False
         nominee_role_id = nominee.get("role", {}).get("id") if nominee.get("role") else None
         
-        # 如果被提名者是贞洁者，且能力未使用，且提名者是镇民
-        if (nominee_role_id == "virgin" and 
-            not nominee.get("virgin_ability_used", False) and
-            nominator.get("role_type") == "townsfolk"):
-            
-            # 标记贞洁者能力已使用
+        # "第一次被提名"这个事件本身就会消耗贞洁者的能力，不管这次提名者是不是镇民、
+        # 贞洁者当时是否中毒/醉酒——所以能力是否已用掉，只取决于"是否已经被提名过"，
+        # 不能把"提名者是镇民"也塞进同一个门槛里，否则第一次被非镇民提名不会消耗能力，
+        # 之后镇民再提名一次还会再触发（这是之前的 bug）。
+        if nominee_role_id == "virgin" and not nominee.get("virgin_ability_used", False):
+            # 标记贞洁者能力已使用（这是她第一次被提名，之后无论谁提名、是否中毒/醉酒都不会再触发）
             nominee["virgin_ability_used"] = True
-            
-            # 提名者立即被处决
-            nominator["alive"] = False
-            
-            # 记录处决
-            self.executions.append({
-                "day": self.day_number,
-                "executed_id": nominator_id,
-                "executed_name": nominator["name"],
-                "reason": "virgin_ability",
-                "vote_count": 0,
-                "required_votes": 0
-            })
-            
-            virgin_triggered = True
-            self.add_log(f"⚡ 贞洁者能力触发！{nominator['name']} 是镇民，立即被处决！", "execution")
-            
-            # 更新提名状态
-            nomination["status"] = "virgin_triggered"
+
+            nominator_is_townsfolk = nominator.get("role_type") == "townsfolk"
+            virgin_affected = nominee.get("poisoned") or nominee.get("drunk")
+
+            if not nominator_is_townsfolk:
+                pass  # 提名者不是镇民，能力不触发，提名正常进入投票
+            elif virgin_affected:
+                self.add_log(f"贞洁者 {nominee['name']} 处于中毒/醉酒状态，能力未触发", "info")
+            else:
+                # 提名者立即被处决
+                nominator["alive"] = False
+
+                # 记录处决
+                self.executions.append({
+                    "day": self.day_number,
+                    "executed_id": nominator_id,
+                    "executed_name": nominator["name"],
+                    "reason": "virgin_ability",
+                    "vote_count": 0,
+                    "required_votes": 0
+                })
+
+                virgin_triggered = True
+                self.add_log(f"⚡ 贞洁者能力触发！{nominator['name']} 是镇民，立即被处决！", "execution")
+
+                # 更新提名状态
+                nomination["status"] = "virgin_triggered"
         
         return {
             "success": True, 
@@ -1126,15 +1151,14 @@ class Game:
         if not voter["alive"] and not voter["vote_token"]:
             return {"success": False, "error": "该死亡玩家已经使用过投票令牌"}
         
-        # 管家投票限制：只有当主人投票时才能投票
-        if voter.get("butler_master_id") and vote_value:
+        # 管家投票限制：只有当主人投了赞成票时才能投票（管家中毒/醉酒时能力失效，不受限制）
+        # 主人的投票可能来自说书人控制台(votes)或玩家端(votes_detail)两条路径，都要检查
+        butler_affected = voter.get("poisoned") or voter.get("drunk")
+        if voter.get("butler_master_id") and vote_value and not butler_affected:
             master_id = voter["butler_master_id"]
-            # 检查主人是否已经在这次提名中投了赞成票
-            master_voted = False
-            for v in nomination["votes"]:
-                if v["voter_id"] == master_id and v["vote"]:
-                    master_voted = True
-                    break
+            master_voted = any(v["voter_id"] == master_id and v["vote"] for v in nomination["votes"])
+            if not master_voted:
+                master_voted = nomination.get("votes_detail", {}).get(master_id, {}).get("vote") is True
             if not master_voted:
                 master_name = voter.get("butler_master_name", "主人")
                 return {"success": False, "error": f"管家只能在主人（{master_name}）投赞成票后才能投赞成票"}
@@ -1340,9 +1364,26 @@ class Game:
         # 只剩2名玩家且恶魔存活，邪恶获胜
         if len(alive_players) <= 2 and demons_alive:
             return {"ended": True, "winner": "evil", "reason": "邪恶势力占领了小镇"}
-        
+
         return {"ended": False}
-    
+
+    def check_mayor_win_condition(self):
+        """镇长的特殊胜利条件：只剩3名玩家存活且当天没有处决时，善良阵营获胜。
+        应在白天结束、即将进入夜晚时检查（不是白天中途），只在镇长未中毒/醉酒时生效。"""
+        alive_players = [p for p in self.players if p["alive"]]
+        if len(alive_players) != 3:
+            return {"triggered": False}
+
+        mayor = next((p for p in alive_players if p.get("role") and p["role"].get("id") == "mayor"), None)
+        if not mayor or mayor.get("poisoned") or mayor.get("drunk"):
+            return {"triggered": False}
+
+        executed_today = any(e.get("day") == self.day_number for e in self.executions)
+        if executed_today:
+            return {"triggered": False}
+
+        return {"triggered": True, "reason": "只剩3人存活且今天无人被处决，镇长的能力生效"}
+
     # 更新日期: 2026-01-02 - 红唇女郎能力实现
     def check_scarlet_woman_trigger(self):
         """检查红唇女郎是否触发能力"""
@@ -1454,16 +1495,19 @@ class Game:
         townsfolk_players = [p for p in self.players if p["role_type"] == "townsfolk" and p["id"] != player["id"]]
         if not townsfolk_players:
             return {"message": "场上没有其他镇民", "is_drunk_or_poisoned": is_drunk_or_poisoned}
-        
+
+        if is_drunk_or_poisoned:
+            return self._generate_false_two_player_info("washerwoman", player, "townsfolk", is_drunk_or_poisoned)
+
         target = random.choice(townsfolk_players)
         other_players = [p for p in self.players if p["id"] not in [player["id"], target["id"]]]
         decoy = random.choice(other_players) if other_players else None
-        
+
         players_shown = [target["name"]]
         if decoy:
             players_shown.append(decoy["name"])
             random.shuffle(players_shown)
-        
+
         return {
             "info_type": "washerwoman",
             "players": players_shown,
@@ -1471,28 +1515,34 @@ class Game:
             "message": f"在 {' 和 '.join(players_shown)} 中，有一人是 {target['role']['name']}",
             "is_drunk_or_poisoned": is_drunk_or_poisoned
         }
-    
+
     def _generate_librarian_info(self, player, is_drunk_or_poisoned=False):
         """生成图书管理员信息"""
         outsider_players = [p for p in self.players if p["role_type"] == "outsider"]
         if not outsider_players:
+            if is_drunk_or_poisoned:
+                # 中毒/醉酒时不给出真实的"场上没有外来者"结论，随机编一个假结果
+                return self._generate_false_two_player_info("librarian", player, "outsider", is_drunk_or_poisoned)
             return {"message": "场上没有外来者（你得知0个玩家是外来者）", "is_drunk_or_poisoned": is_drunk_or_poisoned}
-        
+
+        if is_drunk_or_poisoned:
+            return self._generate_false_two_player_info("librarian", player, "outsider", is_drunk_or_poisoned)
+
         target = random.choice(outsider_players)
         other_players = [p for p in self.players if p["id"] not in [player["id"], target["id"]]]
         decoy = random.choice(other_players) if other_players else None
-        
+
         players_shown = [target["name"]]
         if decoy:
             players_shown.append(decoy["name"])
             random.shuffle(players_shown)
-        
+
         # 获取目标的真实角色名（如果是酒鬼，显示"酒鬼"而不是假身份）
         if target.get("is_the_drunk") and target.get("true_role"):
             role_name = target["true_role"]["name"]  # 酒鬼的真实角色名
         else:
             role_name = target["role"]["name"]
-        
+
         return {
             "info_type": "librarian",
             "players": players_shown,
@@ -1500,14 +1550,35 @@ class Game:
             "message": f"在 {' 和 '.join(players_shown)} 中，有一人是 {role_name}",
             "is_drunk_or_poisoned": is_drunk_or_poisoned
         }
+
+    def _generate_false_two_player_info(self, info_type, player, role_category, is_drunk_or_poisoned):
+        """为中毒/醉酒的"两人一真身份"类角色（洗衣妇/图书管理员/调查员）生成不可靠信息：
+        随机挑两名玩家 + 该分类下的随机角色名，不保证与场上真实分布一致。"""
+        candidates = [p for p in self.players if p["id"] != player["id"]]
+        pair = random.sample(candidates, min(2, len(candidates))) if candidates else []
+        players_shown = [p["name"] for p in pair]
+
+        role_pool = self.script["roles"].get(role_category, [])
+        fake_role = random.choice(role_pool) if role_pool else {"name": "未知角色"}
+
+        return {
+            "info_type": info_type,
+            "players": players_shown,
+            "role": fake_role["name"],
+            "message": f"在 {' 和 '.join(players_shown)} 中，有一人是 {fake_role['name']}",
+            "is_drunk_or_poisoned": True
+        }
     
     def _generate_investigator_info(self, player, is_drunk_or_poisoned=False):
         """生成调查员信息"""
+        if is_drunk_or_poisoned:
+            return self._generate_false_two_player_info("investigator", player, "minion", is_drunk_or_poisoned)
+
         # 检查陌客（可能被当作爪牙）
         recluse = next((p for p in self.players if p.get("role") and p["role"].get("id") == "recluse"), None)
-        
+
         minion_players = [p for p in self.players if p["role_type"] == "minion"]
-        
+
         # 如果有陌客，说书人可以选择让陌客被当作爪牙显示
         if recluse and random.random() < 0.5:  # 50%几率陌客被当作爪牙
             target = recluse
@@ -1540,8 +1611,18 @@ class Game:
     
     def _generate_chef_info(self, player, is_drunk_or_poisoned=False):
         """生成厨师信息"""
+        if is_drunk_or_poisoned:
+            # 中毒/醉酒时不给真实数字，随机编一个看似合理的数字
+            pairs = random.randint(0, max(0, len(self.players) // 2))
+            return {
+                "info_type": "chef",
+                "pairs": pairs,
+                "message": f"有 {pairs} 对邪恶玩家相邻",
+                "is_drunk_or_poisoned": True
+            }
+
         evil_players = [p for p in self.players if p["role_type"] in ["minion", "demon"]]
-        
+
         # 计算相邻的邪恶玩家对数
         pairs = 0
         for i, p in enumerate(self.players):
@@ -1549,7 +1630,7 @@ class Game:
                 next_idx = (i + 1) % len(self.players)
                 if self.players[next_idx] in evil_players:
                     pairs += 1
-        
+
         return {
             "info_type": "chef",
             "pairs": pairs,
@@ -1559,10 +1640,19 @@ class Game:
     
     def _generate_empath_info(self, player, is_drunk_or_poisoned=False):
         """生成共情者信息"""
+        if is_drunk_or_poisoned:
+            evil_count = random.randint(0, 2)
+            return {
+                "info_type": "empath",
+                "evil_count": evil_count,
+                "message": f"你的存活邻居中有 {evil_count} 个是邪恶的",
+                "is_drunk_or_poisoned": True
+            }
+
         player_idx = next((i for i, p in enumerate(self.players) if p["id"] == player["id"]), -1)
         if player_idx == -1:
             return {"message": "无法确定位置", "is_drunk_or_poisoned": is_drunk_or_poisoned}
-        
+
         # 找到存活的邻居
         evil_neighbors = 0
         
@@ -1771,28 +1861,32 @@ class Game:
         }
     
     def _generate_undertaker_info(self, player, is_drunk_or_poisoned=False):
-        """生成殡仪馆老板信息 - 得知昨天被处决的玩家的角色"""
-        # 查找最近被处决的玩家
-        if not self.executions:
+        """生成殡仪馆老板信息 - 得知今天被处决的玩家的角色（只限"今天"，不能是之前某天的旧处决）"""
+        # 只看今天（也就是刚结束的这个白天）发生的处决，避免把往日的旧处决当成"今天"重复播报
+        last_execution = next((e for e in reversed(self.executions) if e.get("day") == self.day_number), None)
+        if not last_execution:
             return {
                 "info_type": "undertaker",
-                "message": "昨天没有人被处决",
+                "message": "今天没有人被处决",
                 "is_drunk_or_poisoned": is_drunk_or_poisoned
             }
-        
-        last_execution = self.executions[-1]
+
         executed_player = next((p for p in self.players if p["id"] == last_execution.get("executed_id")), None)
-        
+
         if executed_player:
             # 获取目标的真实角色名（如果是酒鬼，显示"酒鬼"而不是假身份）
             if executed_player.get("is_the_drunk") and executed_player.get("true_role"):
                 role_name = executed_player["true_role"]["name"]
             else:
                 role_name = executed_player["role"]["name"] if executed_player.get("role") else "未知"
+
+            if is_drunk_or_poisoned:
+                role_name = self._random_role_name(exclude=role_name)
+
             return {
                 "info_type": "undertaker",
                 "executed_role": role_name,
-                "message": f"昨天被处决的玩家 {executed_player['name']} 的角色是 {role_name}",
+                "message": f"今天被处决的玩家 {executed_player['name']} 的角色是 {role_name}",
                 "is_drunk_or_poisoned": is_drunk_or_poisoned
             }
         
@@ -1812,19 +1906,30 @@ class Game:
             }
         
         target = target_players[0]
-        
+
         # 获取目标的真实角色名（如果是酒鬼，显示"酒鬼"而不是假身份）
         if target.get("is_the_drunk") and target.get("true_role"):
             role_name = target["true_role"]["name"]
         else:
             role_name = target["role"]["name"] if target.get("role") else "未知"
-        
+
+        if is_drunk_or_poisoned:
+            role_name = self._random_role_name(exclude=role_name)
+
         return {
             "info_type": "ravenkeeper",
             "target_role": role_name,
             "message": f"{target['name']} 的角色是 {role_name}",
             "is_drunk_or_poisoned": is_drunk_or_poisoned
         }
+
+    def _random_role_name(self, exclude=None):
+        """从当前剧本的角色池里随机选一个角色名（用于中毒/醉酒时的虚假信息），尽量避开真实答案"""
+        all_roles = []
+        for role_type in ["townsfolk", "outsider", "minion", "demon"]:
+            all_roles.extend([r["name"] for r in self.script["roles"].get(role_type, [])])
+        candidates = [r for r in all_roles if r != exclude] or all_roles
+        return random.choice(candidates) if candidates else (exclude or "未知角色")
     
     def _generate_oracle_info(self, player, is_drunk_or_poisoned=False):
         """生成神谕者信息 - 得知死亡玩家中有几个是邪恶的"""
@@ -1915,7 +2020,8 @@ def create_game():
         del games[oldest_game_id]
 
     games[game_id] = game
-    
+    set_current_game(game_id)
+
     return jsonify({
         "success": True,
         "game_id": game_id,
@@ -1979,8 +2085,18 @@ def start_night(game_id):
     """开始夜晚"""
     if game_id not in games:
         return jsonify({"error": "游戏不存在"}), 404
-    
+
     game = games[game_id]
+
+    # 镇长胜利条件：白天结束、即将进入夜晚前检查（day_number>0 表示已经过了至少一个白天）
+    if game.day_number > 0:
+        mayor_win = game.check_mayor_win_condition()
+        if mayor_win["triggered"]:
+            game.add_log(f"🏛️ {mayor_win['reason']}，善良阵营获胜！", "game_end")
+            return jsonify({
+                "success": True,
+                "game_end": {"ended": True, "winner": "good", "reason": mayor_win["reason"]}
+            })
     game.start_night()
     night_order = game.get_night_order()
     
@@ -2271,31 +2387,32 @@ def mayor_substitute(game_id):
     if not mayor:
         return jsonify({"error": "场上没有镇长"}), 400
     
+    # 这个接口在 /start_day 之前调用（此时 game.night_deaths 还是空的，真正的死亡列表要等
+    # Game.start_day() 里的 process_night_kills() 才会生成）。所以必须直接改 game.demon_kills
+    # （恶魔当晚的击杀意图列表），process_night_kills() 之后会基于这份列表正确结算。
+    demon_kills = getattr(game, 'demon_kills', [])
+
     if substitute_id:
         substitute = next((p for p in game.players if p["id"] == substitute_id), None)
         if not substitute:
             return jsonify({"error": "无效的替死玩家"}), 400
-        
-        # 替死玩家死亡，镇长存活
-        # 更新夜间死亡列表
-        for death in game.night_deaths:
-            if death.get("mayor_targeted") and death["player_id"] == mayor["id"]:
-                death["player_id"] = substitute_id
-                death["player_name"] = substitute["name"]
-                death["cause"] = "镇长替死"
-                death.pop("mayor_targeted", None)
-                break
-        
+
+        # 把恶魔当晚对镇长的击杀目标改成替死玩家；镇长本人不再是目标
+        for kill in demon_kills:
+            if kill.get("target_id") == mayor["id"]:
+                kill["target_id"] = substitute_id
+                kill["target_name"] = substitute["name"]
+                kill["mayor_substitute"] = True
+
         game.add_log(f"镇长 {mayor['name']} 的能力触发，{substitute['name']} 替镇长死亡", "night")
         return jsonify({"success": True, "substitute": substitute["name"]})
     else:
-        # 镇长自己死亡
-        for death in game.night_deaths:
-            if death.get("mayor_targeted"):
-                death.pop("mayor_targeted", None)
-                break
-        
-        game.add_log(f"镇长 {mayor['name']} 选择不使用替死能力", "night")
+        # 镇长的能力是被动安全效果："另一个玩家可能会代替你死亡"——
+        # 不选替死目标时，规则上是"无人死亡"（镇长本人不会真的死），而不是镇长自己死，
+        # 所以直接把这条针对镇长的击杀意图从列表里移除
+        game.demon_kills = [k for k in demon_kills if k.get("target_id") != mayor["id"]]
+
+        game.add_log(f"镇长 {mayor['name']} 的能力触发，今晚无人死亡", "night")
         return jsonify({"success": True, "substitute": None})
 
 @app.route('/api/game/<game_id>/check_ravenkeeper', methods=['GET'])
@@ -2803,4 +2920,4 @@ def get_game_code(game_id):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5001)

@@ -5,6 +5,9 @@ __pycache__/
 venv/
 *.log
 
+# TTS 语音缓存（服务端生成的音频文件，不需要入库）
+static/audio/tts_cache/
+
 # Local-only cost / usage notes
 *_CURSORPRO+用量排行*.md
 
