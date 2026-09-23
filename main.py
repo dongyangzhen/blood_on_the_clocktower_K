@@ -52,6 +52,16 @@ class Game:
         self.pending_moonchild = None  # 等待处理的月之子（死亡时触发）
         # 邪恶阵营专属聊天室（爪牙+恶魔之间商量夜间行动用，好人角色看不到）
         self.evil_chat = []
+        # 杀手技能公开宣称记录（结构化数据，供控制台轮询后向全场播报；只含"谁指认了谁、死没死"，
+        # 不含是否真杀手/具体原因，避免给全场提前剧透）
+        self.slayer_claims = []
+        # 邪恶阵营首夜得知的"场上不存在的身份"（官方规则：邪恶阵营首夜会被告知几个没有被抽中
+        # 的镇民/外来者角色，方便他们冒充这些身份混淆视听）——只在第一次用到时计算，之后固定不变
+        self.not_in_play_bluffs = None
+        # 第二夜起的三段式夜晚流程（僧侣段→邪恶阵营段→全员段）里，"准备进入白天"按钮
+        # 只能在真正进入"全员段"（播报完"所有人请睁眼"）之后才出现，避免玩家在僧侣/邪恶
+        # 阶段还没轮到自己时就提前点了准备，导致全员段被提前跳过
+        self.everyone_phase_started = False
 
 
     def to_dict(self):
@@ -69,7 +79,8 @@ class Game:
             "votes": self.votes,
             "executions": self.executions,
             "night_deaths": self.night_deaths,
-            "game_log": self.game_log
+            "game_log": self.game_log,
+            "slayer_claims": self.slayer_claims
         }
     
     def add_log(self, message, log_type="info"):
@@ -153,8 +164,7 @@ class Game:
             selected_roles.extend(type_roles[:count])
         
         random.shuffle(selected_roles)
-        random.shuffle(player_names)
-        
+
         # 为酒鬼准备假的镇民角色列表（排除已选的镇民）
         selected_townsfolk_ids = [r["id"] for r in selected_roles if self._get_role_type(r) == "townsfolk"]
         fake_townsfolk_for_drunk = [r for r in available_roles["townsfolk"] if r["id"] not in selected_townsfolk_ids]
@@ -303,6 +313,7 @@ class Game:
         self.demon_kills = []
         self._night_kills_processed = False
         self._pre_process_results = None
+        self.everyone_phase_started = False  # 每晚重置，进入全员段时才置 True
         # 更新日期: 2026-01-05 - 重置驱魔人状态
         self.demon_exorcised_tonight = False  # 重置恶魔被驱魔状态
         # 更新日期: 2026-01-05 - 重置莽夫状态
@@ -317,6 +328,7 @@ class Game:
             # 管家的主人是"每晚"重新选择的，不选则当晚/次日不受限制
             player.pop("butler_master_id", None)
             player.pop("butler_master_name", None)
+            player["ready_for_day"] = False  # "准备进入白天"状态每晚重置
 
 
             # 检查醉酒状态是否过期
@@ -1070,6 +1082,16 @@ class Game:
             if nom["nominator_id"] == nominator_id:
                 return {"success": False, "error": "该玩家今天已经提名过"}
 
+        # 每名玩家每天只能被提名一次
+        for nom in self.nominations:
+            if nom["nominee_id"] == nominee_id:
+                return {"success": False, "error": "该玩家今天已经被提名过"}
+
+        # 当前有提名正在投票中时不能发起新提名，必须等这一轮投票结束（进入 executed/failed/
+        # virgin_triggered 等终态）才能提名下一个人——同一时间只能有一场投票在进行
+        if any(nom["status"] == "voting" for nom in self.nominations):
+            return {"success": False, "error": "当前有提名正在投票中，请等待投票结束后再发起新的提名"}
+
         # 每天最多提名3次（self.nominations 在 start_day() 时会清空，所以这里的长度就是"今天"的提名数）
         if len(self.nominations) >= 3:
             return {"success": False, "error": "今天的提名次数已达上限（最多3次）"}
@@ -1151,52 +1173,83 @@ class Game:
         if not voter["alive"] and not voter["vote_token"]:
             return {"success": False, "error": "该死亡玩家已经使用过投票令牌"}
         
-        # 管家投票限制：只有当主人投了赞成票时才能投票（管家中毒/醉酒时能力失效，不受限制）
+        # 管家投票限制：只有当主人投了赞成票时，管家的赞成票才算数（管家中毒/醉酒时能力失效，不受限制）。
+        # 注意：这里不再拒绝投票请求——管家可以正常投出赞成票、正常记录在结果里，
+        # 只是不计入最终票数。这样场上才能通过"投票结果里显示他投了赞成，但总票数没涨"来验证他是不是真管家。
         # 主人的投票可能来自说书人控制台(votes)或玩家端(votes_detail)两条路径，都要检查
         butler_affected = voter.get("poisoned") or voter.get("drunk")
+        counted = True
         if voter.get("butler_master_id") and vote_value and not butler_affected:
             master_id = voter["butler_master_id"]
             master_voted = any(v["voter_id"] == master_id and v["vote"] for v in nomination["votes"])
             if not master_voted:
                 master_voted = nomination.get("votes_detail", {}).get(master_id, {}).get("vote") is True
             if not master_voted:
-                master_name = voter.get("butler_master_name", "主人")
-                return {"success": False, "error": f"管家只能在主人（{master_name}）投赞成票后才能投赞成票"}
-        
+                counted = False
+
         vote_record = {
             "voter_id": voter_id,
             "voter_name": voter["name"],
             "vote": vote_value,  # True = 赞成, False = 反对
-            "voter_alive": voter["alive"]
+            "voter_alive": voter["alive"],
+            "counted": counted  # 管家未经授权的赞成票会记录但不计入票数
         }
-        
+
         nomination["votes"].append(vote_record)
-        if vote_value:
+        if vote_value and counted:
             nomination["vote_count"] += 1
-            
+
         # 死亡玩家投票后消耗令牌
         if not voter["alive"] and vote_value:
             voter["vote_token"] = False
-        
+
+        # 投票过程中不公开记录"谁投了什么"——只留一条不含具体票值的私有日志给说书人自己看，
+        # 完整结果等 execute() 结算时才作为一条汇总一次性公开播报
         vote_text = "赞成" if vote_value else "反对"
-        self.add_log(f"{voter['name']} 对 {nomination['nominee_name']} 投了{vote_text}票", "vote")
-        return {"success": True}
+        self.add_log(f"[私密] {voter['name']} 对 {nomination['nominee_name']} 投了{vote_text}票", "vote_private")
+        return {"success": True, "vote_count": nomination["vote_count"], "counted": counted}
     
     # 更新日期: 2026-01-02 - 修复圣徒能力，添加红唇女郎处决后检测
+    def _log_vote_summary(self, nomination):
+        """投票结算时，一次性公开播报每个人投了什么（在此之前个人投票只记私密日志，不公开）"""
+        voted_yes_ids = set()
+        voted_no_ids = set()
+        for v in nomination.get("votes", []):
+            (voted_yes_ids if v.get("vote") else voted_no_ids).add(v.get("voter_id"))
+        for pid, detail in nomination.get("votes_detail", {}).items():
+            (voted_yes_ids if detail.get("vote") else voted_no_ids).add(pid)
+
+        parts = []
+        for p in self.players:
+            if p["id"] in voted_yes_ids:
+                parts.append(f"{p['name']}：赞成")
+            elif p["id"] in voted_no_ids:
+                parts.append(f"{p['name']}：反对")
+            elif p.get("alive", True):
+                parts.append(f"{p['name']}：弃权")
+            # 死亡且没投票的玩家不列出来，避免列表太长
+
+        self.add_log(
+            f"🗳️ 对 {nomination['nominee_name']} 的投票结果（共 {nomination.get('vote_count', 0)} 票赞成）—— " + "，".join(parts),
+            "vote_result"
+        )
+
     def execute(self, nomination_id):
         """执行处决"""
         nomination = next((n for n in self.nominations if n["id"] == nomination_id), None)
         if not nomination:
             return {"success": False, "error": "无效的提名"}
-        
+
         nominee = next((p for p in self.players if p["id"] == nomination["nominee_id"]), None)
         if not nominee:
             return {"success": False, "error": "无效的被提名者"}
-        
+
+        self._log_vote_summary(nomination)
+
         # 计算需要的票数（存活玩家的一半）
         alive_count = len([p for p in self.players if p["alive"]])
         required_votes = (alive_count // 2) + 1
-        
+
         if nomination["vote_count"] >= required_votes:
             # 更新日期: 2026-01-05 - 恶魔代言人保护检查
             # 检查被提名者是否被恶魔代言人保护
@@ -1420,7 +1473,9 @@ class Game:
         scarlet_woman["role"] = demon_role
         scarlet_woman["role_type"] = "demon"
         
-        self.add_log(f"💋 红唇女郎 {scarlet_woman['name']} 继承了恶魔身份！成为 {demon_role.get('name', '恶魔')}！", "game_event")
+        # 这条只能说书人自己看：谁变成了恶魔是绝密信息，绝不能进公开日志（"info" 不在
+        # public_log 的白名单类型里，只会出现在说书人控制台自己的日志流中）
+        self.add_log(f"💋 红唇女郎 {scarlet_woman['name']} 继承了恶魔身份！成为 {demon_role.get('name', '恶魔')}！", "info")
         
         return {
             "triggered": True,
@@ -1930,7 +1985,32 @@ class Game:
             all_roles.extend([r["name"] for r in self.script["roles"].get(role_type, [])])
         candidates = [r for r in all_roles if r != exclude] or all_roles
         return random.choice(candidates) if candidates else (exclude or "未知角色")
-    
+
+    def get_not_in_play_bluffs(self):
+        """邪恶阵营首夜得知的"场上不存在的身份"：从没被抽中的镇民/外来者角色里随机选3个，
+        固定不变（只算一次），方便邪恶阵营互相配合、用这些身份打配合的谎。"""
+        if self.not_in_play_bluffs is not None:
+            return self.not_in_play_bluffs
+
+        in_play_ids = {
+            p["role"]["id"] for p in self.players
+            if p.get("role") and not p.get("is_the_drunk")
+        }
+        # 酒鬼显示的假镇民角色也算"在场"（桌面上摆着这张牌），真实的酒鬼角色本身不算
+        in_play_ids |= {
+            p["role"]["id"] for p in self.players
+            if p.get("is_the_drunk") and p.get("role")
+        }
+
+        candidates = []
+        for role_type in ["townsfolk", "outsider"]:
+            for role in self.script["roles"].get(role_type, []):
+                if role["id"] not in in_play_ids:
+                    candidates.append(role["name"])
+
+        self.not_in_play_bluffs = random.sample(candidates, min(3, len(candidates)))
+        return self.not_in_play_bluffs
+
     def _generate_oracle_info(self, player, is_drunk_or_poisoned=False):
         """生成神谕者信息 - 得知死亡玩家中有几个是邪恶的"""
         dead_players = [p for p in self.players if not p["alive"]]
@@ -2486,76 +2566,107 @@ def revive_player(game_id):
     return jsonify({"success": False, "error": "无效的玩家"})
 
 # 更新日期: 2026-01-05 - 杀手白天能力
+# 更新日期: 2026-01-XX - 按官方规则，任何存活玩家白天都可以公开"宣称"自己是杀手并选择目标（这本身就是
+# 场上常见的虚张声势策略之一）；只有真正的杀手、能力还没用过时，宣称才会真正生效并消耗能力。
+# 不是杀手的宣称会被公开记录（毕竟在真实桌面上大家都看得到谁站起来宣称了），但不会产生任何效果、
+# 也不会消耗任何东西——所以接口不再对"不是杀手"直接报错拒绝，而是正常返回一个"宣称无效"的结果。
 @app.route('/api/game/<game_id>/slayer_ability', methods=['POST'])
 def slayer_ability(game_id):
-    """杀手使用白天能力"""
+    """玩家公开宣称使用杀手能力（可能是真杀手，也可能是虚张声势）"""
     if game_id not in games:
         return jsonify({"error": "游戏不存在"}), 404
-    
+
     data = request.json
     game = games[game_id]
     slayer_id = data.get('slayer_id')
     target_id = data.get('target_id')
-    
-    # 找到杀手
-    slayer = next((p for p in game.players if p["id"] == slayer_id), None)
-    if not slayer:
-        return jsonify({"error": "无效的杀手玩家"}), 400
-    
-    # 检查是否是杀手角色
-    if not slayer.get("role") or slayer["role"].get("id") != "slayer":
-        return jsonify({"error": "该玩家不是杀手"}), 400
-    
-    # 检查杀手是否存活
-    if not slayer["alive"]:
-        return jsonify({"error": "杀手已死亡"}), 400
-    
-    # 检查能力是否已使用
-    if slayer.get("ability_used"):
-        return jsonify({"error": "杀手的能力已使用过"}), 400
-    
-    # 找到目标
+
+    claimant = next((p for p in game.players if p["id"] == slayer_id), None)
+    if not claimant:
+        return jsonify({"error": "无效的玩家"}), 400
+
+    if not claimant["alive"]:
+        return jsonify({"error": "死亡玩家不能宣称使用技能"}), 400
+
     target = next((p for p in game.players if p["id"] == target_id), None)
     if not target:
         return jsonify({"error": "无效的目标玩家"}), 400
-    
-    # 检查目标是否存活
+
     if not target["alive"]:
         return jsonify({"error": "目标玩家已死亡"}), 400
-    
-    # 标记能力已使用
-    slayer["ability_used"] = True
-    
-    # 检查杀手是否醉酒或中毒（能力无效）
-    is_affected = slayer.get("drunk") or slayer.get("poisoned")
-    
-    # 检查目标是否是恶魔
-    is_demon = target.get("role_type") == "demon"
-    
+
+    is_real_slayer = claimant.get("role", {}).get("id") == "slayer"
+
     result = {
         "success": True,
-        "slayer_name": slayer["name"],
+        "slayer_name": claimant["name"],
         "target_name": target["name"],
-        "ability_used": True
+        "is_real_slayer": is_real_slayer
     }
-    
+
+    def record_public_claim(target_died):
+        # 记录一条结构化数据，供控制台轮询后向全场播报（语音+所有玩家手机上的公开日志）。
+        # 只暴露"谁指认了谁、死没死"——是不是真杀手、为什么没死，这些只有宣称者自己知道，
+        # 不放进公开记录，不然"没杀死"就等于当场实锤"你不是杀手"，破坏游戏本来该有的模糊性。
+        if not hasattr(game, 'slayer_claims'):
+            game.slayer_claims = []
+        game.slayer_claims.append({
+            "id": len(game.slayer_claims) + 1,
+            "claimant_id": slayer_id,
+            "claimant_name": claimant["name"],
+            "target_id": target_id,
+            "target_name": target["name"],
+            "target_died": target_died,
+            "time": datetime.now().isoformat()
+        })
+        # 公开日志用中性表述，同理不透露具体原因
+        if target_died:
+            pass  # 下面各分支已经各自写了一条 "death" 类型的公开日志，这里不用重复
+        else:
+            game.add_log(f"🗡️ {claimant['name']} 公开宣称对 {target['name']} 使用杀手技能，什么都没有发生", "game_event")
+
+    if not is_real_slayer:
+        # 虚张声势：公开宣称了，但其实不是杀手，什么都不会发生，也不消耗任何东西
+        game.add_log(f"🗡️ {claimant['name']} 公开宣称对 {target['name']} 使用杀手技能……但他根本不是杀手，什么都没发生", "ability")
+        result["target_died"] = False
+        result["ability_used"] = False
+        result["reason"] = "宣称者不是真正的杀手"
+        record_public_claim(False)
+        return jsonify(result)
+
+    if claimant.get("ability_used"):
+        return jsonify({"error": "杀手的能力已使用过"}), 400
+
+    # 标记能力已使用（真杀手，无论命中与否，这次宣称都会消耗掉唯一的一次机会）
+    claimant["ability_used"] = True
+    result["ability_used"] = True
+
+    # 检查杀手是否醉酒或中毒（能力无效）
+    is_affected = claimant.get("drunk") or claimant.get("poisoned")
+
+    # 检查目标是否是恶魔
+    is_demon = target.get("role_type") == "demon"
+
     if is_affected:
         # 杀手醉酒/中毒，能力无效，但仍然消耗
-        game.add_log(f"🗡️ {slayer['name']}（杀手）公开选择了 {target['name']}，但能力无效（醉酒/中毒）", "ability")
+        game.add_log(f"🗡️ {claimant['name']}（杀手）公开选择了 {target['name']}，但能力无效（醉酒/中毒）", "ability")
         result["target_died"] = False
         result["reason"] = "杀手醉酒或中毒，能力无效"
+        record_public_claim(False)
     elif is_demon:
         # 目标是恶魔，死亡
         target["alive"] = False
-        game.add_log(f"🗡️ {slayer['name']}（杀手）公开选择了 {target['name']}，{target['name']} 是恶魔，立即死亡！", "death")
+        game.add_log(f"🗡️ {claimant['name']}（杀手）公开选择了 {target['name']}，{target['name']} 是恶魔，立即死亡！", "death")
         result["target_died"] = True
         result["game_end"] = game.check_game_end()
+        record_public_claim(True)
     else:
         # 目标不是恶魔，不死亡
-        game.add_log(f"🗡️ {slayer['name']}（杀手）公开选择了 {target['name']}，{target['name']} 不是恶魔，无事发生", "ability")
+        game.add_log(f"🗡️ {claimant['name']}（杀手）公开选择了 {target['name']}，{target['name']} 不是恶魔，无事发生", "ability")
         result["target_died"] = False
         result["reason"] = "目标不是恶魔"
-    
+        record_public_claim(False)
+
     return jsonify(result)
 
 # 更新日期: 2026-01-05 - 获取杀手状态
@@ -2581,6 +2692,30 @@ def get_slayer_status(game_id):
         return jsonify({
             "has_slayer": False
         })
+
+@app.route('/api/game/<game_id>/evil_bluffs', methods=['GET'])
+def get_evil_bluffs(game_id):
+    """获取邪恶阵营首夜得知的"场上不存在的身份"（固定3个，只算一次）"""
+    if game_id not in games:
+        return jsonify({"error": "游戏不存在"}), 404
+
+    game = games[game_id]
+    return jsonify({
+        "success": True,
+        "bluffs": game.get_not_in_play_bluffs()
+    })
+
+
+@app.route('/api/game/<game_id>/start_everyone_phase', methods=['POST'])
+def start_everyone_phase(game_id):
+    """标记夜晚"全员同时段"已开始（播报完"所有人请睁眼"之后调用），
+    "准备进入白天"按钮要等这个标记为真才能在玩家手机上出现"""
+    if game_id not in games:
+        return jsonify({"error": "游戏不存在"}), 404
+
+    game = games[game_id]
+    game.everyone_phase_started = True
+    return jsonify({"success": True})
 
 # 更新日期: 2026-01-05 - 获取驱魔人之前选过的目标
 @app.route('/api/game/<game_id>/exorcist_targets', methods=['GET'])
@@ -2920,4 +3055,4 @@ def get_game_code(game_id):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    app.run(debug=True, port=5001, host='0.0.0.0')

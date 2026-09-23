@@ -102,6 +102,8 @@ function initEventListeners() {
     document.getElementById('voteNoBtn').addEventListener('click', () => vote(false));
     document.getElementById('nominateSubmitBtn').addEventListener('click', submitNomination);
     document.getElementById('readyForNightBtn').addEventListener('click', toggleReadyForNight);
+    document.getElementById('readyForDayBtn').addEventListener('click', toggleReadyForDay);
+    document.getElementById('slayerClaimSubmitBtn').addEventListener('click', submitSlayerClaim);
 
     const historyBtn = document.getElementById('historyBtn');
     if (historyBtn) historyBtn.addEventListener('click', showHistoryModal);
@@ -532,8 +534,16 @@ async function pollGameState() {
     playerState.currentPhase = result.current_phase;
     playerState.dayNumber = result.day_number;
     playerState.nightNumber = result.night_number;
+    playerState.everyonePhaseStarted = result.everyone_phase_started || false;
     playerState.nominations = result.nominations || [];
     playerState.readyStatus = result.ready_status || null;
+    if (result.ready_status) {
+        playerState.readyForDayStatus = {
+            my_ready: result.ready_status.my_ready_for_day || false,
+            ready_count: result.ready_status.ready_for_day_count || 0,
+            total_alive: result.ready_status.total_alive || 0
+        };
+    }
     playerState.alive = result.my_status?.alive ?? true;
     playerState.hasVoteToken = result.my_status?.vote_token ?? true;
     playerState.nightAction = result.night_action;
@@ -612,9 +622,13 @@ async function pollGameState() {
 }
 
 function handleNewMessages(messages) {
+    // 如果玩家当前正有待处理的行动（比如投毒者要选目标），不能用消息面板盖住行动界面，
+    // 否则行动界面会被顶掉、且 hasActiveMessage 还会锁住行动面板60秒刷不出来——改用弹窗展示，
+    // 不影响行动面板；消息本身已经存进历史消息里，弹窗关掉也不会丢
+    const hasBlockingPendingAction = currentPendingAction && currentPendingAction.status === 'pending';
     messages.forEach(msg => {
         if (!msg.read) {
-            if (msg.type === 'night_result' || msg.type === 'info') {
+            if ((msg.type === 'night_result' || msg.type === 'info') && !hasBlockingPendingAction) {
                 displayMessageInNightPanel(msg);
                 playerState.hasActiveMessage = true;
                 playerState.messageShownAt = Date.now();
@@ -751,7 +765,9 @@ function updateGameState() {
 
     updateNominatePanel();
     updateReadyForNightPanel();
+    updateReadyForDayPanel();
     updateEvilChatVisibility();
+    updateSlayerClaimPanel();
 }
 
 // ==================== 邪恶阵营聊天室 ====================
@@ -779,7 +795,20 @@ async function pollEvilChat() {
     const result = await apiCall(`/api/player/evil_chat/${playerState.gameId}/${playerState.playerId}`);
     if (result.success) {
         renderEvilChat(result.messages || []);
+        renderEvilTeammates(result.teammates || []);
     }
+}
+
+// 邪恶阵营互相认识身份，列出队友名单+身份，方便协调（自己也会出现在列表里）
+function renderEvilTeammates(teammates) {
+    const container = document.getElementById('evilChatTeammates');
+    if (!container) return;
+
+    container.innerHTML = teammates.map(t => `
+        <span class="evil-teammate-tag${t.alive ? '' : ' dead'}">
+            玩家${t.id}（${t.name}） - ${t.role_name}${t.alive ? '' : ' †'}
+        </span>
+    `).join('');
 }
 
 function renderEvilChat(messages) {
@@ -813,6 +842,55 @@ async function sendEvilChatMessage() {
 
     input.value = '';
     pollEvilChat();
+}
+
+function updateSlayerClaimPanel() {
+    const panel = document.getElementById('slayerClaimPanel');
+    if (!panel) return;
+
+    // 官方规则：白天任何存活玩家都可以公开宣称使用杀手技能（不限于真正的杀手，这是场上常见的虚张声势）
+    const canShow = playerState.currentPhase === 'day' && playerState.alive;
+    panel.style.display = canShow ? 'block' : 'none';
+    if (!canShow) return;
+
+    const select = document.getElementById('slayerClaimTargetSelect');
+    const currentValue = select.value;
+    select.innerHTML = '<option value="">-- 选择目标玩家 --</option>' +
+        playerState.players
+            .filter(p => p.alive && p.id !== playerState.playerId)
+            .map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('');
+    if (currentValue) select.value = currentValue;
+}
+
+async function submitSlayerClaim() {
+    const select = document.getElementById('slayerClaimTargetSelect');
+    const targetId = parseInt(select.value);
+    if (!targetId) {
+        showInfo('请选择要指认的玩家');
+        return;
+    }
+
+    const result = await apiCall(`/api/game/${playerState.gameId}/slayer_ability`, 'POST', {
+        slayer_id: playerState.playerId,
+        target_id: targetId
+    });
+
+    if (!result.success) {
+        showInfo(result.error || '宣称失败');
+        return;
+    }
+
+    if (!result.is_real_slayer) {
+        showInfo(`你宣称对 ${result.target_name} 使用杀手技能……但你并不是真正的杀手，什么都没发生。`, '宣称结果');
+    } else if (result.target_died) {
+        showInfo(`${result.target_name} 是恶魔，已经死亡！`, '杀手技能命中');
+    } else {
+        showInfo(result.reason === '杀手醉酒或中毒，能力无效'
+            ? '你处于中毒/醉酒状态，能力无效。'
+            : `${result.target_name} 不是恶魔，什么都没发生。`, '宣称结果');
+    }
+
+    select.value = '';
 }
 
 function updateReadyForNightPanel() {
@@ -853,6 +931,46 @@ async function toggleReadyForNight() {
     updateReadyForNightPanel();
 }
 
+// 准备进入白天（每一夜的全员同时行动阶段——不管这晚有没有夜间能力，看完私密信息或
+// 完成操作后都在手机上点准备，全部准备好后自动进入白天）
+function updateReadyForDayPanel() {
+    const panel = document.getElementById('readyForDayPanel');
+    if (!panel) return;
+
+    const canShow = playerState.currentPhase === 'night' && playerState.alive && playerState.everyonePhaseStarted;
+    panel.style.display = canShow ? 'block' : 'none';
+    if (!canShow) return;
+
+    const status = playerState.readyForDayStatus || { my_ready: false, ready_count: 0, total_alive: 0 };
+    document.getElementById('readyForDayStatus').textContent = `${status.ready_count} / ${status.total_alive} 人已准备`;
+
+    const btn = document.getElementById('readyForDayBtn');
+    btn.textContent = status.my_ready ? '✓ 已准备（点击取消）' : '☀️ 我准备好了';
+    btn.classList.toggle('btn-secondary', status.my_ready);
+    btn.classList.toggle('btn-primary', !status.my_ready);
+}
+
+async function toggleReadyForDay() {
+    const currentlyReady = playerState.readyForDayStatus?.my_ready || false;
+    const result = await apiCall('/api/player/ready_for_day', 'POST', {
+        game_id: playerState.gameId,
+        player_id: playerState.playerId,
+        ready: !currentlyReady
+    });
+
+    if (!result.success) {
+        showInfo(result.error || '操作失败');
+        return;
+    }
+
+    playerState.readyForDayStatus = {
+        my_ready: result.ready,
+        ready_count: result.ready_count,
+        total_alive: result.total_alive
+    };
+    updateReadyForDayPanel();
+}
+
 function updateNominatePanel() {
     const panel = document.getElementById('nominatePanel');
     if (!panel) return;
@@ -870,7 +988,7 @@ function updateNominatePanel() {
     select.innerHTML = '<option value="">-- 选择要提名的玩家 --</option>' +
         playerState.players
             .filter(p => p.id !== playerState.playerId)
-            .map(p => `<option value="${p.id}">${p.name}${p.alive ? '' : ' (已死亡)'}</option>`).join('');
+            .map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）${p.alive ? '' : ' (已死亡)'}</option>`).join('');
     if (currentValue) select.value = currentValue;
 }
 
@@ -917,7 +1035,7 @@ function updatePlayerCircle() {
         return `
             <div class="player-roster-item ${isSelf ? 'self' : ''} ${isDead ? 'dead' : ''}">
                 <span class="roster-icon">${statusIcon}</span>
-                <span class="roster-name">${player.name}${isSelf ? ' (你)' : ''}</span>
+                <span class="roster-name">玩家${player.id}（${player.name}）${isSelf ? ' (你)' : ''}</span>
                 ${!isOnline ? '<span class="roster-offline">离线</span>' : ''}
             </div>
         `;
@@ -1068,7 +1186,7 @@ function showDayActionPanel(action) {
                 <label>选择目标:</label>
                 <select id="dayActionTarget" class="form-select">
                     <option value="">-- 选择玩家 --</option>
-                    ${targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                    ${targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                 </select>
             </div>
             
@@ -1220,7 +1338,7 @@ function showPendingAction(action) {
                     <label>选择目标:</label>
                     <select id="pendingTarget" class="form-select">
                         <option value="">-- 选择玩家 --</option>
-                        ${targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                        ${targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                     </select>
                 </div>
             `;
@@ -1230,14 +1348,14 @@ function showPendingAction(action) {
                     <label>选择第一个目标:</label>
                     <select id="pendingTarget1" class="form-select">
                         <option value="">-- 选择玩家 --</option>
-                        ${targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                        ${targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                     </select>
                 </div>
                 <div class="target-select-group" style="margin-top: 1rem;">
                     <label>选择第二个目标:</label>
                     <select id="pendingTarget2" class="form-select">
                         <option value="">-- 选择玩家 --</option>
-                        ${targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                        ${targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                     </select>
                 </div>
             `;
@@ -1248,7 +1366,7 @@ function showPendingAction(action) {
                     ${[1,2,3].slice(0, maxTargets).map(i => `
                         <select id="pendingTarget${i}" class="form-select" style="margin-top: ${i > 1 ? '0.5rem' : '0'};">
                             <option value="">-- 目标${i} (${i === 1 ? '必选' : '可选'}) --</option>
-                            ${targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                            ${targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                         </select>
                     `).join('')}
                 </div>
@@ -1403,7 +1521,7 @@ async function showPitHagAction(action) {
             <label>选择目标玩家:</label>
             <select id="pitHagTarget" class="form-select" onchange="updatePitHagPlayerPreview()">
                 <option value="">-- 选择玩家 --</option>
-                ${targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                ${targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
             </select>
         </div>
         
@@ -1607,7 +1725,7 @@ function showNightAction(action) {
                     <label>选择目标:</label>
                     <select id="nightTarget" class="form-select">
                         <option value="">-- 选择玩家 --</option>
-                        ${action.targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                        ${action.targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                     </select>
                 </div>
             `;
@@ -1617,14 +1735,14 @@ function showNightAction(action) {
                     <label>选择第一个目标:</label>
                     <select id="nightTarget1" class="form-select">
                         <option value="">-- 选择玩家 --</option>
-                        ${action.targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                        ${action.targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                     </select>
                 </div>
                 <div class="target-select-group" style="margin-top: 1rem;">
                     <label>选择第二个目标:</label>
                     <select id="nightTarget2" class="form-select">
                         <option value="">-- 选择玩家 --</option>
-                        ${action.targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                        ${action.targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                     </select>
                 </div>
             `;
@@ -1833,7 +1951,7 @@ function showRavenkeeperPanel(targets) {
             <label style="color: var(--color-gold); font-weight: bold;">选择要查验的玩家:</label>
             <select id="ravenkeeperTarget" class="form-select" style="margin-top: 0.5rem;">
                 <option value="">-- 选择一名玩家 --</option>
-                ${targets.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                ${targets.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
             </select>
         </div>
         

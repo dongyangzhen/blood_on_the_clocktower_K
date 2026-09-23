@@ -195,12 +195,45 @@ function setupEventListeners() {
     document.getElementById('discussionTimerResetBtn').addEventListener('click', resetDiscussionTimerUI);
 }
 
+// 记住上一局的玩家名字，下一局同座位号默认沿用，不用每把重新输入
+const SAVED_PLAYER_NAMES_KEY = 'botc_saved_player_names';
+
+function loadSavedPlayerNames() {
+    try {
+        const raw = localStorage.getItem(SAVED_PLAYER_NAMES_KEY);
+        return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function savePlayerNames(names) {
+    try {
+        localStorage.setItem(SAVED_PLAYER_NAMES_KEY, JSON.stringify(names));
+    } catch (e) {
+        console.warn('[savePlayerNames] 保存玩家名字失败', e);
+    }
+}
+
+// 把当前输入框里的名字（不管有没有开始游戏）实时存起来，这样光是打字、还没点"开始游戏"
+// 就刷新页面，也不会白打
+function saveCurrentPlayerInputs() {
+    const names = [];
+    for (let i = 1; i <= gameState.playerCount; i++) {
+        const input = document.getElementById(`playerName${i}`);
+        names.push(input ? input.value.trim() : '');
+    }
+    savePlayerNames(names);
+}
+
 function updatePlayerInputs() {
     const grid = document.getElementById('playerInputGrid');
     grid.innerHTML = '';
-    
+
+    const savedNames = loadSavedPlayerNames();
+
     for (let i = 1; i <= gameState.playerCount; i++) {
-        const existingName = gameState.players[i - 1]?.name || '';
+        const existingName = gameState.players[i - 1]?.name || savedNames[i - 1] || '';
         grid.innerHTML += `
             <div class="player-input-item">
                 <label>座位 ${i}</label>
@@ -208,6 +241,11 @@ function updatePlayerInputs() {
             </div>
         `;
     }
+
+    // 每个输入框打字时都实时保存，不用等点了"开始游戏"才存
+    grid.querySelectorAll('input[id^="playerName"]').forEach(input => {
+        input.addEventListener('input', saveCurrentPlayerInputs);
+    });
 }
 
 async function updateRoleDistribution() {
@@ -316,6 +354,7 @@ function getPlayerNames() {
         const input = document.getElementById(`playerName${i}`);
         names.push(input.value.trim() || `玩家${i}`);
     }
+    savePlayerNames(names); // 记住这次输入的名字，下一局自动带出来
     return names;
 }
 
@@ -434,6 +473,9 @@ async function handleManualAssign() {
 // ===== 游戏开始 =====
 async function startGame() {
     AudioManager.unlock();
+
+    // 全新一局，之前游戏里"已经播报过的杀手宣称"记录不再适用，清空
+    seenSlayerClaimIds = new Set();
 
     // 隐藏设置面板，显示游戏面板
     document.getElementById('setupPanel').style.display = 'none';
@@ -633,7 +675,7 @@ function updateRedHerringOptions() {
     select.innerHTML = '<option value="">-- 选择玩家 --</option>' + 
         goodPlayers.map(p => {
             const isPreselected = p.id === preselectedId;
-            return `<option value="${p.id}" ${isPreselected ? 'selected' : ''}>${p.name} (${p.role?.name || '未知'})${isPreselected ? ' [预选]' : ''}</option>`;
+            return `<option value="${p.id}" ${isPreselected ? 'selected' : ''}>玩家${p.id}（${p.name}） (${p.role?.name || '未知'})${isPreselected ? ' [预选]' : ''}</option>`;
         }).join('');
 }
 
@@ -1040,10 +1082,10 @@ function updatePlayerSelects() {
     const allPlayers = gameState.players;
     
     nominatorSelect.innerHTML = '<option value="">选择提名者</option>' +
-        alivePlayers.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+        alivePlayers.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('');
     
     nomineeSelect.innerHTML = '<option value="">选择被提名者</option>' +
-        allPlayers.map(p => `<option value="${p.id}">${p.name}${p.alive ? '' : ' (已死亡)'}</option>`).join('');
+        allPlayers.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）${p.alive ? '' : ' (已死亡)'}</option>`).join('');
 }
 
 // ===== 阶段控制 =====
@@ -1107,12 +1149,379 @@ async function startNight() {
 
     AudioManager.playBgm('night');
     AudioManager.playSfx('phase');
-    AudioManager.speak(`第 ${gameState.nightNumber} 夜降临，天黑请闭眼`);
-
-    // 更新日期: 2026-01-12 - 自动通知第一位玩家行动
-    if (gameState.nightOrder.length > 0) {
-        await notifyNextPlayerAction(0);
+    AudioManager.speak(`第 ${gameState.nightNumber} 夜降临`);
+    // 只有第一夜最开始的"天黑请闭眼"连续念3遍，第二夜起只念一遍
+    if (gameState.nightNumber === 1) {
+        speakCloseEyes('天黑请闭眼');
+    } else {
+        AudioManager.speak('天黑请闭眼');
     }
+
+    // 第一夜：邪恶阵营互认身份+投毒阶段；第二夜起：僧侣计时段 → 邪恶阵营同时行动段。
+    // 两者之后都接全员同时段（私密信息/操作 + 准备进白天）。
+    await runOtherNightFlow(gameState.nightNumber >= 2);
+}
+
+// "请闭眼"类播报连续念3遍，确保大家都能听清、反应过来（跟现实里说书人的做法一致）
+function speakCloseEyes(text) {
+    AudioManager.speak(text);
+    AudioManager.speak(text);
+    AudioManager.speak(text);
+}
+
+// ===== 夜晚流程：（第一夜：邪恶阵营互认+投毒；第二夜起：僧侣计时段）→ 邪恶阵营同时行动段 → 全员同时段+准备进白天 =====
+async function runOtherNightFlow(includeMonkPhase) {
+    if (includeMonkPhase) {
+        await runMonkPhase();
+        if (gameState.currentPhase !== 'night') return; // 期间游戏可能已经结束
+
+        const nextIndex = gameState.currentNightIndex;
+        const nextItem = gameState.nightOrder[nextIndex];
+        if (nextItem && nextItem.simultaneousGroup === 'evil') {
+            const groupItems = [];
+            let i = nextIndex;
+            while (i < gameState.nightOrder.length && gameState.nightOrder[i].simultaneousGroup === 'evil') {
+                groupItems.push(gameState.nightOrder[i]);
+                i++;
+            }
+            await handleEvilSimultaneousGroupOnly(nextIndex, groupItems);
+        }
+    } else {
+        // 第一夜：不管场上邪恶阵营具体是谁、有没有投毒者，都固定走一遍"互认身份"阶段
+        await runFirstNightEvilPhase();
+    }
+    if (gameState.currentPhase !== 'night') return;
+
+    await runEveryoneElsePhase();
+    if (gameState.currentPhase !== 'night') return;
+
+    await startDay();
+}
+
+// 僧侣阶段：不管场上有没有僧侣，都固定播报"僧侣请睁眼"→固定等满15秒→"僧侣请闭眼"。
+// 这段等待时长本身不随僧侣是否存在或是否提交而变化，避免通过时长推断出场上有没有僧侣。
+// 僧侣如果存在但超时未操作，直接跳过（其它角色一律只提醒不跳过，这是本轮用户明确要的例外）。
+async function runMonkPhase() {
+    AudioManager.speak('僧侣请睁眼');
+    addLogEntry('🌙 僧侣阶段开始（固定等待15秒）', 'phase');
+
+    const monkIndex = gameState.nightOrder.findIndex(item => item.role_id === 'monk');
+    const monkItem = monkIndex !== -1 ? gameState.nightOrder[monkIndex] : null;
+
+    if (monkItem) {
+        const actionConfig = {
+            max_targets: 1,
+            can_skip: false,
+            use_alive_only: true,
+            description: '选择一名玩家（今晚保护他不被恶魔击杀）'
+        };
+        await apiCall('/api/storyteller/notify_action', 'POST', {
+            game_id: gameState.gameId,
+            player_id: monkItem.player_id,
+            action_type: monkItem.action_type,
+            action_config: actionConfig
+        });
+        addLogEntry(`📱 已通知 ${monkItem.player_name} 进行行动`, 'info');
+    }
+
+    // 固定等满15秒，不管中途是否提交，避免"多久进入下一步"泄露僧侣是否存在
+    await new Promise(resolve => setTimeout(resolve, 15000));
+    if (gameState.currentPhase !== 'night') return;
+
+    if (monkItem) {
+        const choicesResult = await apiCall(`/api/storyteller/player_choices/${gameState.gameId}`);
+        const choice = choicesResult.choices && choicesResult.choices[monkItem.player_id];
+        if (choice && !choice.confirmed) {
+            await handleNightAction(monkIndex);
+            await completeNightActionWithTarget(monkIndex, { skipAdvance: true });
+        } else {
+            // 僧侣没有及时提交，直接跳过（这是唯一会真正强制跳过的角色）
+            await apiCall('/api/storyteller/clear_pending_action', 'POST', {
+                game_id: gameState.gameId,
+                player_id: monkItem.player_id
+            });
+            addLogEntry(`${monkItem.player_name} (僧侣) 超时未操作，已跳过`, 'night');
+        }
+        monkItem.handled = true;
+        gameState.currentNightIndex = monkIndex + 1;
+    }
+
+    renderNightOrder();
+    AudioManager.speak('僧侣请闭眼');
+}
+
+// 邪恶同时行动段（第二夜起）：直接复用 handleEvilSimultaneousGroup 的落地逻辑，但不在结尾自动调用
+// notifyNextPlayerAction（那是给第一夜严格顺序流程遗留的旧路径），改由 runOtherNightFlow 统一编排后续阶段。
+// 第一夜的邪恶阵营互认身份走单独的 runFirstNightEvilPhase，不经过这里。
+async function handleEvilSimultaneousGroupOnly(startIndex, groupItems) {
+    clearNightTurnTimer();
+    stopNightChoicePolling();
+
+    AudioManager.speak('邪恶阵营请开始行动');
+    addLogEntry(`🗨️ 邪恶阵营同时行动：${groupItems.map(i => `${i.player_name}(${i.role_name})`).join('、')}`, 'phase');
+
+    for (const item of groupItems) {
+        const actionConfig = {
+            max_targets: 1,
+            can_skip: true,
+            use_alive_only: true,
+            description: item.ability || ''
+        };
+        await apiCall('/api/storyteller/notify_action', 'POST', {
+            game_id: gameState.gameId,
+            player_id: item.player_id,
+            action_type: item.action_type,
+            action_config: actionConfig
+        });
+    }
+    addLogEntry(`📱 已同时通知邪恶阵营行动：${groupItems.map(i => i.player_name).join('、')}`, 'info');
+
+    const waitingItems = groupItems.filter(item => item.action_type !== 'other');
+    if (waitingItems.length > 0) {
+        await waitForEvilGroupSubmissions(waitingItems);
+    }
+    if (gameState.currentPhase !== 'night') return;
+
+    for (const item of groupItems) {
+        const idx = gameState.nightOrder.indexOf(item);
+        await handleNightAction(idx);
+        await completeNightActionWithTarget(idx, { skipAdvance: true });
+    }
+
+    groupItems.forEach(item => { item.handled = true; });
+    gameState.currentNightIndex = startIndex + groupItems.length;
+    renderNightOrder();
+    AudioManager.speak('恶魔与爪牙请闭眼');
+}
+
+// 第一夜：邪恶阵营（爪牙+恶魔，恶魔首夜本身不行动）互相确认身份，如果有投毒者需要投毒——
+// 不管场上邪恶阵营具体是谁、有没有投毒者，都固定播报"恶魔与爪牙请睁眼"，让邪恶阵营互相确认身份
+// （官方规则里的"认爪牙/认恶魔"环节，只在第一夜发生）。
+// 完成条件：有投毒者就等他真正提交（不设超时，不跳过）；没有投毒者就固定等满60秒——
+// 这个固定等待时长是关键：不能让"有没有投毒者"通过"多快结束"被反推出来，
+// 跟僧侣阶段固定等待90秒改30秒的privacy设计是同一个原则。
+async function runFirstNightEvilPhase() {
+    await AudioManager.speakAndWait('恶魔与爪牙请睁眼，请互相确认同伴身份');
+    if (gameState.currentPhase !== 'night') return;
+
+    // 官方规则：邪恶阵营首夜会被告知几个"场上不存在的身份"，方便他们互相配合冒充这些身份。
+    // 用同一个固定不变的三个身份发给所有邪恶阵营（不只是夜序里有行动的那几个，比如男爵/红唇女郎
+    // 首夜也没有行动，但一样要知道），这样大家口径才能对得上
+    const allEvilPlayers = gameState.players.filter(p => p.alive && (p.role_type === 'minion' || p.role_type === 'demon'));
+    if (allEvilPlayers.length > 0) {
+        const bluffResult = await apiCall(`/api/game/${gameState.gameId}/evil_bluffs`);
+        const bluffs = bluffResult?.bluffs || [];
+        if (bluffs.length > 0) {
+            const bluffText = `场上不存在的身份（可以用来冒充）：${bluffs.join('、')}`;
+            for (const p of allEvilPlayers) {
+                await apiCall('/api/storyteller/send_message', 'POST', {
+                    game_id: gameState.gameId,
+                    player_id: p.id,
+                    type: 'night_result',
+                    title: '🎭 场外身份',
+                    content: bluffText
+                });
+            }
+            addLogEntry(`🎭 已告知邪恶阵营场外身份：${bluffs.join('、')}`, 'info');
+        }
+    }
+
+    const evilItems = gameState.nightOrder.filter(item =>
+        (item.role_type === 'minion' || item.role_type === 'demon') && !item.handled
+    );
+
+    for (const item of evilItems) {
+        const actionConfig = {
+            max_targets: 1,
+            can_skip: true,
+            use_alive_only: true,
+            description: item.ability || ''
+        };
+        await apiCall('/api/storyteller/notify_action', 'POST', {
+            game_id: gameState.gameId,
+            player_id: item.player_id,
+            action_type: item.action_type,
+            action_config: actionConfig
+        });
+    }
+    if (evilItems.length > 0) {
+        addLogEntry(`📱 已同时通知邪恶阵营行动：${evilItems.map(i => i.player_name).join('、')}`, 'info');
+    }
+
+    const poisonerItem = evilItems.find(item => item.role_id === 'poisoner');
+    if (poisonerItem) {
+        await waitForEvilGroupSubmissions([poisonerItem]);
+    } else {
+        await new Promise(resolve => setTimeout(resolve, 60000));
+    }
+    if (gameState.currentPhase !== 'night') return;
+
+    for (const item of evilItems) {
+        if (item.action_type === 'other') continue; // 间谍等没有可提交目标的角色不需要落地结算
+        const idx = gameState.nightOrder.indexOf(item);
+        await handleNightAction(idx);
+        await completeNightActionWithTarget(idx, { skipAdvance: true });
+    }
+
+    evilItems.forEach(item => { item.handled = true; });
+    renderNightOrder();
+    AudioManager.speak('恶魔与爪牙请闭眼');
+}
+
+// 全员同时段：播报"所有人请睁眼"，僧侣、邪恶阵营之外剩余的角色同时处理——
+// 信息类角色自动生成信息并推送；需要选目标的角色（占卜师/被触发的守鸦人等）推送通知后台等待，
+// 超时只提醒不强制跳过。所有存活玩家（不论这晚有没有夜间能力）在手机上点"准备"，
+// 全部准备好后才自动进入白天——这是本阶段唯一的推进条件。
+//
+// 注意：handleNightAction/completeNightActionWithTarget 依赖几个模块级共享变量
+// （currentNightActionTarget 等），不能真的并发调用，否则会互相覆盖目标——所以这里对
+// "落地结算"这一步用 simultaneousChain 串行化，但通知推送（玩家能同时收到）和玩家自己
+// 提交选择的时机完全不受这个串行化影响，玩家侧感受依然是同时行动。
+let simultaneousChain = Promise.resolve();
+
+async function runEveryoneElsePhase() {
+    addLogEntry('🌅 全员同时行动阶段开始', 'phase');
+    // 先把播报读完，再开始推送私密信息/行动界面——不能让播报和信息展示抢时间，
+    // 不然玩家可能在语音还没读完的时候就看到自己的私密信息弹出来了。
+    // 这句播报第一夜和第二夜起完全一样（隐私原则：措辞不能因为场上情况不同而变化）
+    await AudioManager.speakAndWait('所有人请睁眼，完成操作后，请点击准备进入白天');
+    if (gameState.currentPhase !== 'night') return; // 播报期间游戏可能已经结束
+
+    // 只有真正进入全员段才允许玩家点"准备进入白天"，避免僧侣/邪恶阶段时手快点了准备，
+    // 导致全员段被提前跳过
+    await apiCall(`/api/game/${gameState.gameId}/start_everyone_phase`, 'POST', {});
+
+    addLogEntry('等待所有玩家查看私密信息/完成操作后准备进入白天', 'info');
+    simultaneousChain = Promise.resolve();
+
+    // 用 .handled 标记而不是 currentNightIndex 切片——僧侣/邪恶阵营处理过的条目在夜序里
+    // 不一定连续（尤其是第一夜邪恶阵营互认阶段，投毒者、间谍在夜序里的位置可能不相邻）
+    const remainingItems = gameState.nightOrder.filter(item => !item.handled);
+    const infoItems = [];
+    const selectItems = [];
+
+    for (const item of remainingItems) {
+        const roleId = item.role_id;
+        const isInfo = ['empath', 'undertaker', 'oracle', 'flowergirl',
+            'washerwoman', 'librarian', 'investigator', 'chef', 'clockmaker', 'spy'].includes(roleId);
+        if (isInfo) {
+            infoItems.push(item);
+        } else if (item.action_type && item.action_type !== 'other' && item.action_type !== 'day_ability') {
+            selectItems.push(item);
+        }
+    }
+
+    // 信息类角色排进串行结算链（几乎瞬间完成，玩家不会感知到先后顺序）
+    for (const item of infoItems) {
+        const idx = gameState.nightOrder.indexOf(item);
+        enqueueSimultaneousResolution(idx, item);
+    }
+
+    // 需要选目标的角色并发通知（推送是并发的，玩家能同时看到行动界面），
+    // 提交后台轮询检测到就排进同一条结算链
+    selectItems.forEach(item => {
+        const idx = gameState.nightOrder.indexOf(item);
+        const actionConfig = {
+            max_targets: (item.role_id === 'fortune_teller' || item.action_type === 'investigate') ? 2 : 1,
+            can_skip: item.role_id !== 'butler', // 管家不能跳过，必须选一个人当主人
+            use_alive_only: item.role_id !== 'fortune_teller',
+            description: item.role_id === 'butler'
+                ? '选择一名玩家（不能选自己）作为你的主人，明天你只能跟随他投票'
+                : (item.ability || '')
+        };
+        apiCall('/api/storyteller/notify_action', 'POST', {
+            game_id: gameState.gameId,
+            player_id: item.player_id,
+            action_type: item.action_type,
+            action_config: actionConfig
+        });
+        pollSimultaneousSelectItem(item, idx);
+    });
+
+    if (infoItems.length > 0 || selectItems.length > 0) {
+        addLogEntry(`📱 已同时通知剩余角色行动：${remainingItems.map(i => i.player_name).join('、')}`, 'info');
+    }
+
+    gameState.currentNightIndex = gameState.nightOrder.length;
+    renderNightOrder();
+
+    await waitForAllReadyForDay();
+}
+
+// 把一次"落地结算"追加到串行链上，避免和其它角色的结算并发写共享变量
+function enqueueSimultaneousResolution(idx, item) {
+    simultaneousChain = simultaneousChain.then(async () => {
+        if (gameState.currentPhase !== 'night') return;
+        await handleNightAction(idx);
+        const infoText = document.getElementById('infoResultText')?.value;
+        if (infoText && infoText.trim()) {
+            await apiCall('/api/storyteller/send_message', 'POST', {
+                game_id: gameState.gameId,
+                player_id: item.player_id,
+                type: 'night_result',
+                title: `🌙 ${item.role_name}`,
+                content: infoText
+            });
+        }
+        await completeNightActionWithTarget(idx, { skipAdvance: true });
+    }).catch(e => console.error('结算失败:', e));
+}
+
+// 全员同时段里，需要选目标的角色一旦提交就排队落地，不强制要求提交才能进入下一步
+function pollSimultaneousSelectItem(item, idx) {
+    let resolved = false;
+    const poll = async () => {
+        if (resolved || gameState.currentPhase !== 'night') return;
+        try {
+            const choicesResult = await apiCall(`/api/storyteller/player_choices/${gameState.gameId}`);
+            const choice = choicesResult.choices && choicesResult.choices[item.player_id];
+            if (choice && !choice.confirmed) {
+                resolved = true;
+                enqueueSimultaneousResolution(idx, item);
+                return; // 已排队，停止轮询
+            }
+        } catch (e) {
+            console.error('轮询全员同时段选择失败:', e);
+        }
+        setTimeout(poll, 2000);
+    };
+    poll();
+}
+
+// 等待所有存活玩家点击"准备进入白天"，全部准备好后才结束这一阶段。
+// 睁眼后满1分钟如果还有人没准备好，TTS 提醒一次，之后每满1分钟还没好就再提醒一次
+// （只提醒不强制推进，跟其它地方"提醒不代跳过"的原则一致）。
+function waitForAllReadyForDay() {
+    return new Promise((resolve) => {
+        let lastReadyCount = -1;
+        const startedAt = Date.now();
+        let nextReminderAt = 60000;
+
+        const poll = async () => {
+            if (gameState.currentPhase !== 'night') { resolve(); return; }
+            try {
+                const result = await apiCall(`/api/game/${gameState.gameId}`);
+                const alive = (result.players || []).filter(p => p.alive);
+                const readyCount = alive.filter(p => p.ready_for_day).length;
+                if (readyCount !== lastReadyCount) {
+                    lastReadyCount = readyCount;
+                    addLogEntry(`⏳ 准备进入白天：${readyCount}/${alive.length}`, 'info');
+                }
+                if (alive.length > 0 && readyCount === alive.length) {
+                    resolve();
+                    return;
+                }
+                if (Date.now() - startedAt >= nextReminderAt) {
+                    AudioManager.speak('还有人没有准备进入白天，请尽快准备');
+                    nextReminderAt += 60000;
+                }
+            } catch (e) {
+                console.error('轮询准备进入白天状态失败:', e);
+            }
+            setTimeout(poll, 2500);
+        };
+        poll();
+    });
 }
 
 function renderNightOrder() {
@@ -1129,7 +1538,7 @@ function renderNightOrder() {
              onclick="handleNightAction(${index})">
             <div class="night-order-number">${index + 1}</div>
             <div class="night-order-info">
-                <div class="night-order-name">${item.player_name}</div>
+                <div class="night-order-name">玩家${item.player_id}（${item.player_name}）</div>
                 <div class="night-order-role">${item.role_name}: ${item.ability.substring(0, 50)}...</div>
                 ${index === gameState.currentNightIndex ? `<span class="night-timer-badge" id="nightTimerBadge"></span>` : ''}
             </div>
@@ -1273,7 +1682,7 @@ async function handleNightAction(index) {
     
     // 基本信息
     const headerHTML = `
-        <h4 style="margin-bottom: var(--spacing-md); color: var(--color-gold);">${item.player_name} - ${item.role_name}</h4>
+        <h4 style="margin-bottom: var(--spacing-md); color: var(--color-gold);">玩家${item.player_id}（${item.player_name}） - ${item.role_name}</h4>
         <p style="margin-bottom: var(--spacing-lg); color: var(--text-secondary);">${item.ability}</p>
         ${playerChoiceHTML}
     `;
@@ -1305,7 +1714,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 不击杀任何人 --</option>
                         ${killTargets.map(p => 
-                            `<option value="${p.id}">${p.name}${p.id === item.player_id ? ' (自己 - 传刀)' : ''}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）${p.id === item.player_id ? ' (自己 - 传刀)' : ''}</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1315,7 +1724,7 @@ async function handleNightAction(index) {
                     <select id="nightActionSecondTarget" class="form-select" onchange="updateNightActionSecondTarget(this.value)">
                         <option value="">-- 无 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1341,7 +1750,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 不击杀任何人 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1369,7 +1778,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 不击杀 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1378,7 +1787,7 @@ async function handleNightAction(index) {
                     <select id="nightActionSecondTarget" class="form-select" onchange="updateNightActionSecondTarget(this.value)">
                         <option value="">-- 不击杀 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1388,7 +1797,7 @@ async function handleNightAction(index) {
                     <select id="shabalothReviveTarget" class="form-select">
                         <option value="">-- 不复活任何人 --</option>
                         ${deadPlayers.map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1422,7 +1831,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 不击杀任何人 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1432,7 +1841,7 @@ async function handleNightAction(index) {
                     <select id="poSecondTarget" class="form-select">
                         <option value="">-- 不击杀 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1441,7 +1850,7 @@ async function handleNightAction(index) {
                     <select id="poThirdTarget" class="form-select">
                         <option value="">-- 不击杀 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1468,7 +1877,7 @@ async function handleNightAction(index) {
                         <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                             <option value="">-- 选择第一个玩家 --</option>
                             ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                                `<option value="${p.id}">${p.name}</option>`
+                                `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                             ).join('')}
                         </select>
                     </div>
@@ -1477,7 +1886,7 @@ async function handleNightAction(index) {
                         <select id="nightActionSecondTarget" class="form-select" onchange="updateNightActionSecondTarget(this.value)">
                             <option value="">-- 选择第二个玩家 --</option>
                             ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                                `<option value="${p.id}">${p.name}</option>`
+                                `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                             ).join('')}
                         </select>
                     </div>
@@ -1503,7 +1912,7 @@ async function handleNightAction(index) {
                         <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                             <option value="">-- 选择要保护的玩家 --</option>
                             ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                                `<option value="${p.id}">${p.name}</option>`
+                                `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                             ).join('')}
                         </select>
                     </div>
@@ -1523,7 +1932,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 选择目标 --</option>
                         ${alivePlayers.map(p => 
-                            `<option value="${p.id}">${p.name}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1560,7 +1969,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 选择目标 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name}${p.id === previousTargetId ? ' (前一晚目标)' : ''}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）${p.id === previousTargetId ? ' (前一晚目标)' : ''}</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1580,7 +1989,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 选择目标 --</option>
                         ${alivePlayers.map(p => 
-                            `<option value="${p.id}">${p.name} (${p.role?.name || '未知'})</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}） (${p.role?.name || '未知'})</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1608,7 +2017,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value); updateSailorDrunkPreview();">
                         <option value="">-- 选择目标 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name} (${p.role?.name || '未知'})</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}） (${p.role?.name || '未知'})</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1743,7 +2152,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value); updateGrandchildPreview();">
                         <option value="">-- 选择孙子 --</option>
                         ${townsfolkPlayers.map(p => 
-                            `<option value="${p.id}">${p.name} (${p.role?.name || '未知'})</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}） (${p.role?.name || '未知'})</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1776,7 +2185,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value);">
                         <option value="">-- 选择主人 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}"${currentMaster && p.id === currentMaster.id ? ' selected' : ''}>${p.name}</option>`
+                            `<option value="${p.id}"${currentMaster && p.id === currentMaster.id ? ' selected' : ''}>玩家${p.id}（${p.name}）</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1813,7 +2222,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value);">
                         <option value="">-- 选择目标 --</option>
                         ${availableTargets.map(p => 
-                            `<option value="${p.id}">${p.name} (${p.role?.name || '未知'})</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}） (${p.role?.name || '未知'})</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1855,7 +2264,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value);">
                         <option value="">-- 选择目标 --</option>
                         ${availableTargets.map(p => 
-                            `<option value="${p.id}">${p.name} (${p.role?.name || '未知'})</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}） (${p.role?.name || '未知'})</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1892,7 +2301,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value); updatePitHagPreview();">
                         <option value="">-- 选择玩家 --</option>
                         ${alivePlayers.filter(p => p.id !== item.player_id).map(p => 
-                            `<option value="${p.id}">${p.name} (当前: ${p.role?.name || '未知'})</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}） (当前: ${p.role?.name || '未知'})</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -1976,7 +2385,7 @@ async function handleNightAction(index) {
                     <select id="nightActionTarget" class="form-select" onchange="updateNightActionTarget(this.value)">
                         <option value="">-- 不选择 --</option>
                         ${allPlayers.map(p => 
-                            `<option value="${p.id}">${p.name}${p.alive ? '' : ' (死亡)'}</option>`
+                            `<option value="${p.id}">玩家${p.id}（${p.name}）${p.alive ? '' : ' (死亡)'}</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -2325,7 +2734,8 @@ async function skipNightAction(index) {
     await notifyNextPlayerAction(gameState.currentNightIndex);
 }
 
-async function completeNightActionWithTarget(index) {
+async function completeNightActionWithTarget(index, options = {}) {
+    const skipAdvance = options.skipAdvance || false;
     clearNightTurnTimer();
     stopNightChoicePolling();
     stopModalChoicePolling();
@@ -2604,17 +3014,23 @@ async function completeNightActionWithTarget(index) {
         }
     }
     addLogEntry(logMessage, 'night');
-    
-    // 更新日期: 2026-01-12 - 自动推送下一位玩家的行动
-    await notifyNextPlayerAction(gameState.currentNightIndex);
+
+    // 邪恶阵营同时行动的编排逻辑会自己控制推进节奏（等一整组都结算完再统一推进一次），
+    // 这里跳过自动推进+自动通知下一位，避免和外层的编排逻辑重入/冲突
+    if (!skipAdvance) {
+        // 更新日期: 2026-01-12 - 自动推送下一位玩家的行动
+        await notifyNextPlayerAction(gameState.currentNightIndex);
+    }
 }
 
 // 自动通知下一位玩家行动（支持跳过离线玩家）
 async function notifyNextPlayerAction(nextIndex) {
     if (!gameState.nightOrder || nextIndex >= gameState.nightOrder.length) {
         clearNightTurnTimer();
-        // 全部夜间角色行动已处理完毕
-        if (gameState.nightOrder && gameState.nightOrder.length > 0 && gameState.currentPhase === 'night') {
+        // 全部夜间角色行动已处理完毕（夜序本来就是空的——比如抽到的角色全都没有首夜技能——也算完毕）。
+        // 注意：这条播报/日志的措辞不能因为"今晚是不是真的有人行动"而不同——不然玩家能从
+        // "说了什么"反推出"今晚是不是有角色首夜技能"，这跟其它地方"不能通过时长/措辞泄露场上信息"的原则一样
+        if (gameState.nightOrder && gameState.currentPhase === 'night') {
             addLogEntry('夜间行动全部完成', 'phase');
             if (gameSettings.autoAdvanceToDay) {
                 AudioManager.speak('夜间行动全部完成，即将进入白天');
@@ -2659,7 +3075,10 @@ async function notifyNextPlayerAction(nextIndex) {
     const roleId = nextItem.role_id;
     const actionType = nextItem.action_type;
     
-    if (roleId === 'fortune_teller') {
+    if (roleId === 'butler') {
+        actionConfig.can_skip = false; // 管家必须选一个人当主人，不能跳过
+        actionConfig.description = '选择一名玩家（不能选自己）作为你的主人，明天你只能跟随他投票';
+    } else if (roleId === 'fortune_teller') {
         actionConfig.max_targets = 2;
         actionConfig.use_alive_only = false;
         actionConfig.description = '选择两名玩家进行占卜，你会得知他们中是否有恶魔';
@@ -2735,7 +3154,9 @@ async function handleEvilSimultaneousGroup(startIndex, groupItems) {
     clearNightTurnTimer();
     stopNightChoicePolling();
 
-    AudioManager.speak('邪恶阵营请开始行动'); // 不点名具体角色，避免暴露场上有哪些邪恶身份
+    // 第一夜恶魔与爪牙需要互相确认身份（官方规则里的"认爪牙/认恶魔"环节，只在第一夜发生），
+    // "恶魔"和"爪牙"是剧本上公开的角色类型，不算暴露具体是谁
+    AudioManager.speak('恶魔与爪牙请睁眼，请互相确认同伴身份');
     addLogEntry(`🗨️ 邪恶阵营同时行动：${groupItems.map(i => `${i.player_name}(${i.role_name})`).join('、')}`, 'phase');
 
     // 同时通知组内所有人（复用单角色路径里用的同一个通知接口）
@@ -2761,11 +3182,13 @@ async function handleEvilSimultaneousGroup(startIndex, groupItems) {
         await waitForEvilGroupSubmissions(waitingItems);
     }
 
-    // 全部到齐后，依次复用现有的单角色结算函数落地（不重新实现投毒/击杀逻辑）
+    // 全部到齐后，依次复用现有的单角色结算函数落地（不重新实现投毒/击杀逻辑）。
+    // 传 skipAdvance:true 是因为 completeNightActionWithTarget 平时自己会自动推进+通知下一位，
+    // 组里还没结算完的成员会被提前打断，所以这里让它只负责落地，推进交给下面统一处理
     for (const item of groupItems) {
         const idx = gameState.nightOrder.indexOf(item);
         await handleNightAction(idx);
-        await completeNightActionWithTarget(idx);
+        await completeNightActionWithTarget(idx, { skipAdvance: true });
     }
 
     // 上面逐个结算会各自把 currentNightIndex 设成"自己的索引+1"，这里统一纠正成整组之后的位置，
@@ -3004,6 +3427,58 @@ async function startDay() {
         startDiscussionTimer();
         startDayAutoPilot();
     }
+
+    // 杀手宣称的全场播报不依赖自动驾驶开关——不管是不是自动模式，只要有人公开宣称就应该让全场听到
+    startSlayerClaimWatcher();
+}
+
+// ===== 杀手技能公开宣称：全场播报 =====
+// 任何玩家都可能在白天随时公开宣称使用杀手技能（真杀手或虚张声势），这里持续轮询，
+// 一发现新的宣称就立刻用语音向全场播报"谁指认了谁、死没死"——不播报是否真杀手/具体原因，
+// 保留游戏本该有的模糊性。
+let slayerClaimWatcherInterval = null;
+let seenSlayerClaimIds = new Set();
+
+function stopSlayerClaimWatcher() {
+    if (slayerClaimWatcherInterval) {
+        clearInterval(slayerClaimWatcherInterval);
+        slayerClaimWatcherInterval = null;
+    }
+    // 注意：这里不能重置 seenSlayerClaimIds——每天开始都会调用一次 startSlayerClaimWatcher
+    // （内部先调用这个函数清掉上一轮的定时器），如果连"已经播报过的宣称"也一起清空，
+    // 之前几天已经播报过的宣称会在新的一天又被当成"新宣称"重新播报一遍。
+    // 真正需要重置的时机是"开了一局全新的游戏"，见 startGame() 里的调用。
+}
+
+function startSlayerClaimWatcher() {
+    stopSlayerClaimWatcher();
+
+    const poll = async () => {
+        if (!gameState.gameId || gameState.currentPhase !== 'day') {
+            stopSlayerClaimWatcher();
+            return;
+        }
+        try {
+            const result = await apiCall(`/api/game/${gameState.gameId}`);
+            const claims = result?.slayer_claims || [];
+            for (const claim of claims) {
+                if (seenSlayerClaimIds.has(claim.id)) continue;
+                seenSlayerClaimIds.add(claim.id);
+
+                addLogEntry(`🗡️ 玩家${claim.claimant_id}（${claim.claimant_name}） 公开宣称对 玩家${claim.target_id}（${claim.target_name}） 使用杀手技能`, 'game_event');
+                if (claim.target_died) {
+                    AudioManager.speak(`玩家${claim.claimant_id} 公开宣称对 玩家${claim.target_id} 使用杀手技能，玩家${claim.target_id} 死亡！`);
+                } else {
+                    AudioManager.speak(`玩家${claim.claimant_id} 公开宣称对 玩家${claim.target_id} 使用杀手技能，什么都没有发生`);
+                }
+            }
+        } catch (e) {
+            console.error('监听杀手宣称失败:', e);
+        }
+    };
+
+    poll();
+    slayerClaimWatcherInterval = setInterval(poll, 2000);
 }
 
 // ===== 白天讨论计时器 =====
@@ -3055,10 +3530,9 @@ function startDiscussionTimer() {
     }, 1000);
 }
 
-// ===== 白天自动驾驶：轮询发现新提名 / 到点自动结算投票 / 自动通知+结算杀手 =====
+// ===== 白天自动驾驶：轮询发现新提名 / 到点自动结算投票 =====
 let dayAutoPilotInterval = null;
 let dayAutoPilotVoteTimers = {};
-let dayAutoPilotSlayerNotified = false;
 
 function stopDayAutoPilot() {
     if (dayAutoPilotInterval) {
@@ -3067,7 +3541,6 @@ function stopDayAutoPilot() {
     }
     Object.values(dayAutoPilotVoteTimers).forEach(t => clearInterval(t));
     dayAutoPilotVoteTimers = {};
-    dayAutoPilotSlayerNotified = false;
 }
 
 function startDayAutoPilot() {
@@ -3090,15 +3563,24 @@ function startDayAutoPilot() {
                     const existing = gameState.nominations.find(n => n.id === nom.id);
                     if (!existing) {
                         gameState.nominations.push(nom);
-                        addLogEntry(`${nom.nominator_name} 提名了 ${nom.nominee_name}`, 'nomination');
-                        AudioManager.speak(`${nom.nominator_name} 提名了 ${nom.nominee_name}`);
+                        addLogEntry(`玩家${nom.nominator_id}（${nom.nominator_name}） 提名了 玩家${nom.nominee_id}（${nom.nominee_name}）`, 'nomination');
+                        AudioManager.speak(`玩家${nom.nominator_id} 提名了 玩家${nom.nominee_id}`);
                         changed = true;
                         if (nom.status === 'voting' && !dayAutoPilotVoteTimers[nom.id]) {
                             startAutoVoteTimer(nom.id);
                         }
-                    } else if (existing.vote_count !== nom.vote_count || existing.status !== nom.status) {
+                    } else {
+                        // 之前这里只在 vote_count/status 变化时才同步，但投反对票不会改变 vote_count，
+                        // 导致投反对票的人一直不会被同步进 voters/votes，被误判成"还没投票"。
+                        // 改成每次轮询都直接同步整条数据，简单可靠。
+                        const prevVoteCount = existing.vote_count;
+                        const prevStatus = existing.status;
+                        const prevVoters = (existing.voters || []).length;
                         Object.assign(existing, nom);
-                        changed = true;
+                        if (existing.vote_count !== prevVoteCount || existing.status !== prevStatus ||
+                            (existing.voters || []).length !== prevVoters) {
+                            changed = true;
+                        }
                     }
                 }
                 if (changed) renderNominations();
@@ -3114,7 +3596,10 @@ function startDayAutoPilot() {
                     return; // startNight() 已经把阶段切走了，下一轮 poll 会自己检测到并停止
                 }
 
-                await autoPilotHandleSlayer();
+                // 注意：这里不再自动推送"说书人请你进行白天行动"给真正的杀手——
+                // 杀手的能力已经统一走"宣称使用杀手技能"面板（任何存活玩家白天都能看到、
+                // 自己发起），跟别的玩家体验完全一致；自动私推会让真杀手多出一个不一样的、
+                // 且只有他自己会收到的弹窗，等于变相暴露"你是真杀手"，跟这个设计初衷矛盾。
             }
         } catch (e) {
             console.error('白天自动驾驶轮询失败:', e);
@@ -3148,7 +3633,9 @@ function startAutoVoteTimer(nominationId) {
             return;
         }
 
-        const eligible = gameState.players.filter(p => p.alive || p.vote_token);
+        // 死亡玩家的弃票令牌是"可以选择用"，不是必须投——只等存活玩家，
+        // 不然只要有一个死人一直不投，就会永远卡在"还有人没投票"
+        const eligible = gameState.players.filter(p => p.alive);
         const voted = votedPlayerIds(nom);
         const notVoted = eligible.filter(p => !voted.has(p.id));
 
@@ -3173,27 +3660,6 @@ function startAutoVoteTimer(nominationId) {
     dayAutoPilotVoteTimers[nominationId] = interval;
 }
 
-// 杀手能力：白天开始自动通知玩家，玩家提交选择后自动结算（不弹 confirm）
-async function autoPilotHandleSlayer() {
-    const status = await apiCall(`/api/game/${gameState.gameId}/slayer_status`);
-    if (!status.has_slayer || status.ability_used) {
-        dayAutoPilotSlayerNotified = false;
-        return;
-    }
-
-    if (!dayAutoPilotSlayerNotified) {
-        dayAutoPilotSlayerNotified = true;
-        await notifySlayerAction(status.slayer_id);
-    }
-
-    const choicesResult = await apiCall(`/api/storyteller/player_choices/${gameState.gameId}`);
-    const choice = choicesResult.choices && choicesResult.choices[status.slayer_id];
-    if (choice && !choice.confirmed && choice.targets && choice.targets.length > 0) {
-        dayAutoPilotSlayerNotified = false; // 已结算，能力用掉后 slayer_status 会变，重置标记
-        await resolveSlayerAbility(status.slayer_id, choice.targets[0]);
-    }
-}
-
 // 更新日期: 2026-01-05 - 检查杀手能力状态
 // 更新日期: 2026-01-12 - 添加通知玩家行动按钮
 async function checkSlayerAbility() {
@@ -3211,7 +3677,7 @@ async function checkSlayerAbility() {
         // 填充目标选择
         const alivePlayers = gameState.players.filter(p => p.alive && p.id !== result.slayer_id);
         slayerTargetSelect.innerHTML = '<option value="">选择目标</option>' + 
-            alivePlayers.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+            alivePlayers.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('');
         
         // 存储杀手 ID
         slayerSection.dataset.slayerId = result.slayer_id;
@@ -3448,13 +3914,13 @@ function updateInfoPresets() {
             <label>选择玩家:</label>
             <select id="infoPlayerSelect" class="form-select" style="margin-top: var(--spacing-sm);" onchange="setPlayerInfo()">
                 <option value="">-- 选择玩家 --</option>
-                ${gameState.players.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                ${gameState.players.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
             </select>
             <div style="margin-top: var(--spacing-sm);">
                 <label>第二个玩家（可选）:</label>
                 <select id="infoPlayerSelect2" class="form-select" style="margin-top: var(--spacing-sm);" onchange="setPlayerInfo()">
                     <option value="">-- 无 --</option>
-                    ${gameState.players.map(p => `<option value="${p.id}">${p.name}</option>`).join('')}
+                    ${gameState.players.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('')}
                 </select>
             </div>
         `;
@@ -3641,10 +4107,11 @@ async function resolveSlayerAbility(slayerId, targetId) {
         target_id: targetId
     });
 
+    // 全场播报（语音+公开日志）统一交给 startSlayerClaimWatcher 处理，这里不重复播报，
+    // 只做说书人自己看的详细私有日志（含真实原因）
     if (result.success) {
         if (result.target_died) {
             addLogEntry(`🗡️ ${result.slayer_name}（杀手）选择了 ${result.target_name}，${result.target_name} 是恶魔，立即死亡！`, 'death');
-            AudioManager.speak(`${result.target_name} 是恶魔，被杀手当场击杀`);
 
             // 更新本地状态
             if (targetPlayer) {
@@ -3661,7 +4128,6 @@ async function resolveSlayerAbility(slayerId, targetId) {
             updatePlayerSelects();
         } else {
             addLogEntry(`🗡️ ${result.slayer_name}（杀手）选择了 ${result.target_name}，${result.reason || '目标不是恶魔，无事发生'}`, 'ability');
-            AudioManager.speak('目标不是恶魔，无事发生');
         }
 
         // 标记本地杀手能力已使用
@@ -3734,7 +4200,7 @@ function showMayorSubstituteModal(mayor, resolve) {
     const select = document.getElementById('mayorSubstituteSelect');
     const otherPlayers = gameState.players.filter(p => p.id !== mayor.id && p.alive);
     select.innerHTML = '<option value="">-- 无人替死（今晚无人死亡）--</option>' +
-        otherPlayers.map(p => `<option value="${p.id}">${p.name} (${p.role?.name || '未知'})</option>`).join('');
+        otherPlayers.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}） (${p.role?.name || '未知'})</option>`).join('');
 
     modal.classList.add('active');
 
@@ -3830,7 +4296,7 @@ function showRavenkeeperModal(ravenkeeperPlayerId, ravenkeeperName) {
         // 更新选项
         const select = document.getElementById('ravenkeeperTargetSelect');
         select.innerHTML = '<option value="">-- 选择玩家 --</option>' +
-            gameState.players.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+            gameState.players.map(p => `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`).join('');
 
         document.getElementById('ravenkeeperInfoResult').style.display = 'none';
         document.getElementById('closeRavenkeeper').style.display = 'none';
@@ -4057,7 +4523,9 @@ function startVoteTimer(nominationId) {
             return;
         }
 
-        const eligible = gameState.players.filter(p => p.alive || p.vote_token);
+        // 死亡玩家的弃票令牌是"可以选择用"，不是必须投——只等存活玩家，
+        // 不然只要有一个死人一直不投，就会永远卡在"还有人没投票"
+        const eligible = gameState.players.filter(p => p.alive);
         const notVoted = eligible.filter(p => !votedPlayerIds(nom).has(p.id));
 
         if (notVoted.length === 0) {
@@ -4093,23 +4561,37 @@ function openVoteModal(nominationId, resetTimer = true) {
     `;
     
     // 生成投票格子
+    // 投票过程中不展示具体是谁投了赞成/反对——只显示"已投票"，等这条提名结算完（不再是 voting 状态）
+    // 才统一揭晓每个人投了什么，避免中途看到别人的票影响还没投的人
+    const isResolved = nomination.status !== 'voting';
     const voteGrid = document.getElementById('voteGrid');
     voteGrid.innerHTML = gameState.players.map(player => {
-        const voted = nomination.votes?.find(v => v.voter_id === player.id);
-        const votedClass = voted ? (voted.vote ? 'voted-yes' : 'voted-no') : '';
+        // 投票可能来自说书人控制台(votes)或玩家自己手机(votes_detail)两条路径，都要认
+        const consoleVote = nomination.votes?.find(v => v.voter_id === player.id);
+        const playerVoteDetail = nomination.votes_detail?.[player.id];
+        const hasVoted = !!consoleVote || !!playerVoteDetail;
+        const voteValue = consoleVote ? consoleVote.vote : (playerVoteDetail ? playerVoteDetail.vote : null);
+
         const deadClass = !player.alive ? 'dead' : '';
         const canVote = player.alive || player.vote_token;
-        
+
+        let votedClass = '';
+        let statusHtml;
+        if (hasVoted && isResolved) {
+            votedClass = voteValue ? 'voted-yes' : 'voted-no';
+            statusHtml = `<span style="font-size: 0.8rem;">${voteValue ? '✓' : '✗'}</span>`;
+        } else if (hasVoted) {
+            votedClass = 'voted-pending';
+            statusHtml = `<span style="font-size: 0.8rem; color: var(--text-muted);">已投票</span>`;
+        } else {
+            statusHtml = `<button class="vote-btn yes" onclick="castVote(${nomination.id}, ${player.id}, true)" ${!canVote ? 'disabled' : ''}>✓</button>
+                         <button class="vote-btn no" onclick="castVote(${nomination.id}, ${player.id}, false)" ${!canVote ? 'disabled' : ''}>✗</button>`;
+        }
+
         return `
             <div class="vote-player ${votedClass} ${deadClass}">
-                <span class="vote-player-name">${player.name}</span>
-                <div class="vote-buttons">
-                    ${voted ? 
-                        `<span style="font-size: 0.8rem;">${voted.vote ? '✓' : '✗'}</span>` :
-                        `<button class="vote-btn yes" onclick="castVote(${nomination.id}, ${player.id}, true)" ${!canVote ? 'disabled' : ''}>✓</button>
-                         <button class="vote-btn no" onclick="castVote(${nomination.id}, ${player.id}, false)" ${!canVote ? 'disabled' : ''}>✗</button>`
-                    }
-                </div>
+                <span class="vote-player-name">玩家${player.id}（${player.name}）</span>
+                <div class="vote-buttons">${statusHtml}</div>
             </div>
         `;
     }).join('');
@@ -4137,18 +4619,23 @@ async function castVote(nominationId, voterId, vote) {
     // 更新本地数据
     const nomination = gameState.nominations.find(n => n.id === nominationId);
     if (!nomination.votes) nomination.votes = [];
-    
+
     const voter = gameState.players.find(p => p.id === voterId);
     nomination.votes.push({
         voter_id: voterId,
         voter_name: voter.name,
-        vote: vote
+        vote: vote,
+        counted: result.counted !== false
     });
-    
-    if (vote) {
+
+    // 管家未经授权的赞成票不计入票数，这里直接采用后端返回的权威票数，不在前端自行 +1
+    // （比如管家投了赞成但主人没投赞成，票数应该不变——这是验证管家身份的关键信号）
+    if (typeof result.vote_count === 'number') {
+        nomination.vote_count = result.vote_count;
+    } else if (vote) {
         nomination.vote_count++;
     }
-    
+
     // 如果是死亡玩家投赞成票，消耗令牌
     if (!voter.alive && vote) {
         voter.vote_token = false;
@@ -4221,16 +4708,16 @@ async function handleExecute() {
             if (zombuul) {
                 zombuul.appears_dead = true;
             }
-            addLogEntry(`💀 ${nomination.nominee_name} 被处决（看起来死了...）`, 'execution');
+            addLogEntry(`💀 玩家${nomination.nominee_id}（${nomination.nominee_name}） 被处决（看起来死了...）`, 'execution');
         } else {
-            addLogEntry(`${nomination.nominee_name} 被处决`, 'execution');
+            addLogEntry(`玩家${nomination.nominee_id}（${nomination.nominee_name}） 被处决`, 'execution');
         }
         AudioManager.playSfx('execution');
-        AudioManager.speak(`${nomination.nominee_name} 被处决`);
+        AudioManager.speak(`玩家${nomination.nominee_id} 被处决`);
 
         // 检查圣徒被处决
         if (result.saint_executed) {
-            addLogEntry(`⚡ 圣徒 ${nomination.nominee_name} 被处决！邪恶阵营获胜！`, 'game_end');
+            addLogEntry(`⚡ 圣徒 玩家${nomination.nominee_id}（${nomination.nominee_name}） 被处决！邪恶阵营获胜！`, 'game_end');
         }
         
         // 检查红唇女郎触发
@@ -4244,8 +4731,8 @@ async function handleExecute() {
         }
     } else {
         nomination.status = 'failed';
-        addLogEntry(`${nomination.nominee_name} 未获得足够票数，逃过一劫`, 'execution');
-        AudioManager.speak(`${nomination.nominee_name} 未获得足够票数，逃过一劫`);
+        addLogEntry(`玩家${nomination.nominee_id}（${nomination.nominee_name}） 未获得足够票数，逃过一劫`, 'execution');
+        AudioManager.speak(`玩家${nomination.nominee_id} 未获得足够票数，逃过一劫`);
     }
 
     closeModal('voteModal');
@@ -4382,7 +4869,7 @@ function showMoonchildModal(data) {
     
     // 生成存活玩家选项
     const selectHtml = data.alive_players.map(p => 
-        `<option value="${p.id}">${p.name}</option>`
+        `<option value="${p.id}">玩家${p.id}（${p.name}）</option>`
     ).join('');
     document.getElementById('moonchildTargetSelect').innerHTML = 
         `<option value="">-- 不使用能力 --</option>` + selectHtml;
@@ -4674,7 +5161,7 @@ async function generatePlayerInfo(playerId) {
     
     const player = gameState.players.find(p => p.id === playerId);
     document.getElementById('infoContent').innerHTML = `
-        <h4 style="margin-bottom: var(--spacing-md); color: var(--color-gold);">${player.name} - ${player.role?.name || '未知角色'}</h4>
+        <h4 style="margin-bottom: var(--spacing-md); color: var(--color-gold);">玩家${player.id}（${player.name}） - ${player.role?.name || '未知角色'}</h4>
         <div class="info-message">
             ${result.message || '无法生成信息'}
         </div>
@@ -4706,7 +5193,7 @@ function showGameEnd(gameEnd) {
             <h4 style="color: var(--color-gold); margin-bottom: var(--spacing-md);">角色揭示</h4>
             ${gameState.players.map(p => `
                 <div style="display: flex; justify-content: space-between; padding: var(--spacing-sm); border-bottom: 1px solid rgba(255,255,255,0.1);">
-                    <span>${p.name} ${p.alive ? '' : '†'}</span>
+                    <span>玩家${p.id}（${p.name}） ${p.alive ? '' : '†'}</span>
                     <span style="color: var(--color-${p.role_type});">${p.role?.name || '未知'}</span>
                 </div>
             `).join('')}

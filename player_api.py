@@ -204,10 +204,11 @@ def get_player_game_state(game_id, player_id):
         "connected": p.get("connected", False)
     } for p in game.players]
     
-    # 公开日志
+    # 公开日志（"vote_private" 是每次投票时记的私密日志，只有说书人自己能看，
+    # 不放进这里——完整投票结果由 "vote_result" 在结算时一次性公开播报）
     public_log = [
-        log for log in game.game_log 
-        if log["type"] in ["phase", "death", "execution", "game_end", "game_event", "vote"]
+        log for log in game.game_log
+        if log["type"] in ["phase", "death", "execution", "game_end", "game_event", "vote_result"]
     ]
     
     # 当前活跃的提名
@@ -267,6 +268,7 @@ def get_player_game_state(game_id, player_id):
     # "准备进入黑夜"状态（白天没人提名/提名都结算完时，全员准备好可以直接进夜）
     alive_players_for_ready = [p for p in game.players if p.get("alive", True)]
     ready_count = sum(1 for p in alive_players_for_ready if p.get("ready_for_night"))
+    ready_for_day_count = sum(1 for p in alive_players_for_ready if p.get("ready_for_day"))
 
     return jsonify({
         "players": players_public,
@@ -300,10 +302,13 @@ def get_player_game_state(game_id, player_id):
         "public_log": public_log[-30:],  # 最近30条
         "game_end": game_end,
         "current_game_id": current_game_id,
+        "everyone_phase_started": getattr(game, 'everyone_phase_started', False),
         "ready_status": {
             "my_ready": player.get("ready_for_night", False),
             "ready_count": ready_count,
-            "total_alive": len(alive_players_for_ready)
+            "total_alive": len(alive_players_for_ready),
+            "my_ready_for_day": player.get("ready_for_day", False),
+            "ready_for_day_count": ready_for_day_count
         }
     })
 
@@ -312,7 +317,9 @@ def get_night_action_config(role_id, role_type, game, player_id):
     """获取夜间行动配置"""
     alive_players = [p for p in game.players if p.get("alive", True) and p["id"] != player_id]
     all_players = [p for p in game.players if p["id"] != player_id]
-    
+    # 恶魔自刀传灾：小恶魔选自己会死亡+传给一名爪牙，目标列表必须包含自己（仍只能选存活玩家）
+    alive_players_with_self = [p for p in game.players if p.get("alive", True)]
+
     # 基础配置
     config = {
         "type": "other",
@@ -322,13 +329,13 @@ def get_night_action_config(role_id, role_type, game, player_id):
         "max_targets": 1,
         "description": ""
     }
-    
+
     # 根据角色类型配置
     if role_type == "demon":
         config["type"] = "kill"
         config["can_select"] = True
-        config["targets"] = [{"id": p["id"], "name": p["name"]} for p in alive_players]
-        config["description"] = "选择一名玩家击杀"
+        config["targets"] = [{"id": p["id"], "name": p["name"]} for p in alive_players_with_self]
+        config["description"] = "选择一名玩家击杀（也可以选自己——小恶魔自刀会死亡，并让一名存活的爪牙成为新的小恶魔）"
     
     elif role_id == "monk":
         config["type"] = "protect"
@@ -489,9 +496,12 @@ def player_vote():
     if player_id in nomination["voters"]:
         return jsonify({"error": "你已经投过票了"}), 400
 
-    # 管家投票限制：只有当主人投了赞成票时，管家才能投赞成票（管家中毒/醉酒时能力失效，不受限制）
+    # 管家投票限制：只有当主人投了赞成票时，管家的赞成票才算数（管家中毒/醉酒时能力失效，不受限制）。
+    # 注意：这里不再拒绝投票请求——管家可以正常投出赞成票、正常记录在结果里，只是不计入最终票数。
+    # 这样场上才能通过"投票结果里显示他投了赞成，但总票数没涨"来验证他是不是真管家。
     # 主人的投票可能来自玩家端(votes_detail)或说书人控制台(votes)两条路径，都要检查
     butler_affected = player.get("poisoned") or player.get("drunk")
+    counted = True
     if player.get("butler_master_id") and vote_value and not butler_affected:
         master_id = player["butler_master_id"]
         master_voted_yes = nomination["votes_detail"].get(master_id, {}).get("vote") is True
@@ -501,8 +511,7 @@ def player_vote():
                 for v in nomination.get("votes", [])
             )
         if not master_voted_yes:
-            master_name = player.get("butler_master_name", "主人")
-            return jsonify({"error": f"管家只能在主人（{master_name}）投赞成票后才能投赞成票"}), 400
+            counted = False
 
     # 记录投票
     nomination["voters"].append(player_id)
@@ -510,23 +519,26 @@ def player_vote():
         "player_name": player["name"],
         "vote": vote_value,
         "is_alive": player.get("alive", True),
-        "time": datetime.now().isoformat()
+        "time": datetime.now().isoformat(),
+        "counted": counted  # 管家未经授权的赞成票会记录但不计入票数
     }
-    
-    if vote_value:
+
+    if vote_value and counted:
         nomination["vote_count"] = nomination.get("vote_count", 0) + 1
-    
+
     # 如果死亡玩家投赞成票，消耗令牌
     if not player.get("alive", True) and vote_value:
         player["vote_token"] = False
-    
+
+    # 投票过程中不公开记录"谁投了什么"，完整结果等结算时才一次性公开播报
     vote_text = "赞成" if vote_value else "反对"
-    game.add_log(f"{player['name']} 投了{vote_text}票", "vote")
+    game.add_log(f"[私密] {player['name']} 投了{vote_text}票", "vote_private")
 
     return jsonify({
         "success": True,
         "vote_count": nomination.get("vote_count", 0),
-        "total_voters": len(nomination["voters"])
+        "total_voters": len(nomination["voters"]),
+        "counted": counted
     })
 
 
@@ -569,6 +581,45 @@ def player_ready_for_night():
     })
 
 
+# ==================== 准备进入白天 API ====================
+# 第二夜起，僧侣计时段+邪恶同时行动段结束后，其余角色同时行动；每个存活玩家看完私密
+# 信息/完成操作后自己点"准备"，全员准备好后自动进入白天。
+
+@player_bp.route('/api/player/ready_for_day', methods=['POST'])
+def player_ready_for_day():
+    """玩家标记自己已准备好进入白天（可再次调用取消）"""
+    data = request.json
+    game_id = data.get('game_id')
+    player_id = data.get('player_id')
+    ready = data.get('ready', True)
+
+    if game_id not in games:
+        return jsonify({"error": "游戏不存在"}), 404
+
+    game = games[game_id]
+    player = next((p for p in game.players if p["id"] == player_id), None)
+
+    if not player:
+        return jsonify({"error": "无效的玩家"}), 400
+
+    if not player.get("alive", True):
+        return jsonify({"error": "死亡玩家不需要准备"}), 400
+
+    player["ready_for_day"] = bool(ready)
+    game.add_log(f"{player['name']} {'已准备好' if ready else '取消了准备'}进入白天", "info")
+
+    alive_players = [p for p in game.players if p.get("alive", True)]
+    ready_count = sum(1 for p in alive_players if p.get("ready_for_day"))
+
+    return jsonify({
+        "success": True,
+        "ready": player["ready_for_day"],
+        "ready_count": ready_count,
+        "total_alive": len(alive_players),
+        "all_ready": len(alive_players) > 0 and ready_count == len(alive_players)
+    })
+
+
 # ==================== 邪恶阵营专属聊天室 ====================
 # 只有存活的爪牙/恶魔能看到和发言，好人角色完全不知道这个聊天室的存在
 
@@ -587,9 +638,23 @@ def get_evil_chat(game_id, player_id):
     if not player or player.get("role_type") not in EVIL_CHAT_ROLE_TYPES:
         return jsonify({"error": "你不是邪恶阵营，无法查看这个聊天室"}), 403
 
+    # 邪恶阵营互相认识身份，聊天室里附带一份"我们是谁"的名单（存活/死亡都算，
+    # 死亡不会让人忘记自己队友是谁）
+    teammates = [
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "role_name": p.get("role", {}).get("name", "未知"),
+            "alive": p.get("alive", True)
+        }
+        for p in game.players
+        if p.get("role_type") in EVIL_CHAT_ROLE_TYPES
+    ]
+
     return jsonify({
         "success": True,
-        "messages": getattr(game, 'evil_chat', [])
+        "messages": getattr(game, 'evil_chat', []),
+        "teammates": teammates
     })
 
 
@@ -923,19 +988,29 @@ def notify_player_action():
     
     # 占卜师等角色可以选择包括自己在内的所有玩家
     all_players_with_self = [
-        {"id": p["id"], "name": p["name"]} 
+        {"id": p["id"], "name": p["name"]}
         for p in game.players
     ]
-    
+
+    # 恶魔自刀传灾：小恶魔选自己会死亡+传给一名爪牙，所以目标列表必须包含自己（但仍然只能选存活玩家）
+    alive_players_with_self = [
+        {"id": p["id"], "name": p["name"]}
+        for p in game.players
+        if p.get("alive", True)
+    ]
+
     # 构建行动请求
     role = player.get("role", {})
     role_id = role.get("id", "")
     role_name = role.get("name", "未知角色")
-    
+    role_type = player.get("role_type", "")
+
     # 占卜师可以选择包括自己在内的任何玩家
     include_self_roles = ["fortune_teller"]
     if role_id in include_self_roles and not action_config.get("use_alive_only", True):
         target_list = all_players_with_self
+    elif role_type == "demon" and action_config.get("use_alive_only", True):
+        target_list = alive_players_with_self
     elif action_config.get("use_alive_only", True):
         target_list = alive_players
     else:
@@ -1176,6 +1251,20 @@ def ravenkeeper_choose():
         f"[守鸦人] {player['name']} 查验了 {target['name']}，得知角色为 {role_name}",
         "night"
     )
+
+    # 存进玩家自己的私密信箱，避免这条信息只在当时的弹窗里显示一次、关掉就再也看不到
+    if "messages" not in player:
+        player["messages"] = []
+    player["messages"].append({
+        "id": f"msg_{datetime.now().timestamp()}",
+        "type": "night_result",
+        "title": "🐦 守鸦人 - 查验结果",
+        "content": result_data["message"],
+        "time": datetime.now().isoformat(),
+        "read": True  # 提交时已经在弹窗里看过了，不用再当成未读消息弹一次
+    })
+    if len(player["messages"]) > 50:
+        player["messages"] = player["messages"][-50:]
 
     return jsonify({
         "success": True,

@@ -124,7 +124,8 @@ const AudioManager = (() => {
     async function processQueue() {
         if (isSpeaking || speechQueue.length === 0) return;
 
-        const text = speechQueue.shift();
+        const item = speechQueue.shift();
+        const text = item.text;
         isSpeaking = true;
         console.debug(`[AudioManager] 开始朗读："${text}"（队列剩余 ${speechQueue.length} 条）`);
 
@@ -135,6 +136,7 @@ const AudioManager = (() => {
             clearTimeout(watchdogTimer);
             console.debug(`[AudioManager] 朗读结束："${text}"（${reason}）`);
             isSpeaking = false;
+            if (item.onDone) item.onDone();
             processQueue();
         };
 
@@ -162,8 +164,19 @@ const AudioManager = (() => {
     function speak(text) {
         if (!settings.ttsEnabled || !text) return;
         console.debug(`[AudioManager] speak() 被调用："${text}"`);
-        speechQueue.push(text);
+        speechQueue.push({ text });
         processQueue();
+    }
+
+    // 跟 speak() 一样排队播报，但返回一个 Promise，在这句话真正读完（或读失败兜底）后才 resolve——
+    // 用于"必须等这句播报完，才能继续往下推进流程"的场合（比如先读完"XX请睁眼"，再显示私密信息）
+    function speakAndWait(text) {
+        if (!settings.ttsEnabled || !text) return Promise.resolve();
+        console.debug(`[AudioManager] speakAndWait() 被调用："${text}"`);
+        return new Promise(resolve => {
+            speechQueue.push({ text, onDone: resolve });
+            processQueue();
+        });
     }
 
     // 清空排队中的播报（不影响当前正在读的这一句），用于切换阶段等需要跳过积压播报的场合
@@ -215,6 +228,7 @@ const AudioManager = (() => {
         updateSettings,
         unlock,
         speak,
+        speakAndWait,
         clearSpeechQueue,
         playBgm,
         stopBgm,

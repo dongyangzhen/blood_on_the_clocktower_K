@@ -1319,6 +1319,11 @@ body {
     border: 1px solid var(--color-minion);
 }
 
+.vote-player.voted-pending {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
 .vote-player.dead {
     opacity: 0.5;
 }
